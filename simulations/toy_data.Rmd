@@ -1,0 +1,159 @@
+---
+title: "Illustrative comparison of time-aware and non-aware FA on simulated data"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(magrittr)
+library(MOFA2)
+library(cowplot)
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_simulation-", today, "/toy/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir, warning = FALSE, message = FALSE)
+bs <- 12 # base_size
+```
+
+# Load trained models on toy example
+```{r}
+# fits generated using make_toy_example.sh
+mm_aware <- load_model("out/toy_model.hdf5")
+mm_nonaware <- load_model("out/toy_model_noGP.hdf5")
+
+# add time info
+samples_metadata(mm_nonaware) <- left_join(samples_metadata(mm_nonaware),
+                                           samples_metadata(mm_aware),
+                                           by = c("sample", "group"))
+views_names(mm_aware) <- views_names(mm_nonaware) <-  c("view1", "view2", "view3")
+```
+
+# Visualize main model components
+
+```{r, echo = FALSE}
+show_data <- function(mm){
+  df <- left_join(get_data(mm, as.data.frame = TRUE), samples_metadata(mm), by = c("sample", "group"))
+gg_data <- ggplot(df, aes(x = time, y = value, col = group)) +
+    scale_color_manual(values = c(group_1 = "orange", group_2 = "#3D1C59")) +
+  theme(legend.position = "top") + guides(col = guide_legend(title ="")) +
+  geom_point(alpha = 0.5) + facet_wrap(~view) + ylab('measurement') + guides(col= FALSE) +
+  theme_classic(base_size = bs)+ theme(axis.text.x = element_blank(),
+                                       axis.text.y = element_blank(),
+                                       legend.position = "top")
+}
+
+show_factors <- function(mm, aware_model = NULL){
+  if(length(mm@covariates) > 0 && !is.null(mm@covariates)) {
+  df <- plot_factors_vs_cov(mm, covariate = "time", color_by = "group",
+                            factors = "all", return_data = TRUE)
+  } else {
+    df <- get_factors(mm, as.data.frame = TRUE) %>% rename(value.factor = value)
+    df_covariate <- plot_factors_vs_cov(aware_model, covariate = "time",
+                                        color_by = "group", factors = "all", return_data = TRUE) %>%
+      select(group, sample, factor, covariate, value.covariate, color_by)
+    df <- left_join(df, df_covariate, by = c("group", "sample", "factor"))
+  }
+  miss_samples <- get_data(mm, as.data.frame = T, na.rm = FALSE) %>% group_by(sample) %>%
+    summarise(missing = all(is.na(value))) %>% filter(missing) %>% select(sample) %>% unlist()
+  df %<>% mutate(color_by_missing = ifelse(sample %in% miss_samples, "missing", as.character(color_by)))
+  ggplot(df, aes(x = value.covariate, y = value.factor)) + geom_point(aes(color = color_by_missing), size = 1.5, alpha = 0.5) + 
+        facet_grid(~factor) +   theme_classic(base_size = bs) +
+        theme(axis.text = element_text(size = rel(0.9), color = "black"),
+              axis.title = element_text(size = rel(1.2), color = "black"),
+              axis.line = element_line(color = "black", size = 0.5),
+              axis.ticks = element_line(color = "black", size = 0.5),
+              axis.text.y = element_blank(),
+              axis.text.x = element_blank(),
+              legend.position = "top") +
+  scale_color_manual(values = c(group_1 = "orange", group_2 = "#3D1C59", missing= "gray")) +
+    guides(col = FALSE) +
+    xlab("time") + ylab("latent value")
+}
+
+show_weights <- function(mm){
+  df <- get_weights(mm, as.data.frame = TRUE)
+  gg_w <- ggplot(df, aes(x = view, y = (value), col = view)) +
+    facet_grid(~factor) + geom_point(alpha = 0.7) + theme_classic() +
+    scale_color_manual(values = c("view1" = "navy",
+                                  "view2" = "cyan3",
+                                  "view3" = "darkgreen")) +
+    theme_classic(base_size = bs) +
+    xlab("view") + ylab("weight") + theme(legend.position = "top")+ 
+    guides(col = guide_legend(title ="")) + guides(col= F) +
+      theme(axis.text.x = element_blank()) + theme(axis.text.y = element_blank())+
+    geom_boxplot()
+}
+```
+
+## Simulated data
+```{r data, fig.height=3, fig.width=6}
+# the underlying data is the same
+gg_data_aware <- show_data(mm_aware)
+gg_data_nonaware <- show_data(mm_nonaware)
+```
+
+## Learnt factors
+```{r factors, fig.height=3, fig.width=6}
+gg_fac_aware <- show_factors(mm_aware)
+gg_fac_nonaware <- show_factors(mm_nonaware, aware_model = mm_aware)
+```
+
+## Learnt weights
+```{r weights}
+gg_weights_aware <- show_weights(mm_aware)
+gg_weights_nonaware <- show_weights(mm_nonaware)
+```
+
+## Sharedness and smoothness
+MEFISTO can assess smoothness and sharedness of each factor.
+```{r}
+bar_smooth <- plot_smoothness(mm_aware) +
+  theme(strip.text = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "cm"))
+bar_shared <- plot_sharedness((mm_aware)) +
+  theme(strip.text = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "cm"))
+```
+
+## Interpolation
+MEFISTO enables interpolation.
+```{r, fig.height=2, fig.width=3}
+mm_aware <- load_model("out/toy_model.hdf5", load_interpol_Z = TRUE)
+plot_interpolation_vs_covariate(mm_aware, only_mean = FALSE) + 
+  scale_color_manual(values = c(group_1 = "orange", group_2 = "#3D1C59", missing= "gray"))
+```
+
+
+
+# Figures
+## Time-aware model
+```{r example_aware, fig.width=10, fig.height=2.2}
+ggleft <- plot_grid(cowplot::get_legend(gg_data_aware + guides(col = guide_legend())),
+                    gg_data_aware, rel_heights = c(0.1 ,1), ncol =1)
+ggmiddle <-  plot_grid(bar_smooth, bar_shared, gg_fac_aware, rel_heights = c(0.05, 0.05 ,1), align = "v", axis = "lr", ncol =1, nrow = 3)
+ggright <- plot_grid(NULL, gg_weights_aware, rel_heights = c(0.1 ,1), ncol =1)
+plot_grid(ggleft, ggmiddle, ggright, scale =  0.9, rel_widths = c(1.3,1.3,1), nrow = 1)
+```
+
+
+## Time-agnostic model
+```{r example_nonaware, fig.width=10, fig.height=2}
+plot_grid(gg_data_nonaware, gg_fac_nonaware, gg_weights_nonaware,
+                   nrow = 1, scale =  0.9, rel_widths = c(1.3,1.3,1))
+```
+
+## Group legend
+```{r legend, fig.width=4, fig.height=2}
+# save legend of groups
+plot_grid(cowplot::get_legend(gg_fac_aware + guides(col = guide_legend())))
+```
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,842 @@
+---
+title: "MEFISTO application to evodevo data (with simultaneous alignment)"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(MOFA2)
+library(magrittr)
+library(tidyverse)
+library(cowplot)
+library("openxlsx")
+library(reshape2)
+library(scales)
+
+# source plotting and data handling utils functions
+source("utils_evodevo.R")
+
+# set output directory for figures
+today <- Sys.Date()
+figdir = paste0("figures_evodevo-", today, "/all/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+
+# directory of processed count data (used as input)
+countdir <-  "data/counts/"
+datadir <- "data/normalized_counts/"
+
+# directory of meta informatino (orthologue genes, time correspondences and trajectory changes from https://www.nature.com/articles/s41586-019-1338-5)
+metadir <- "data/meta/"
+
+# directory of trained model (trained using train_evodevo.py))
+outdir <- "out/"
+base_nm <- "evodevo_groups_all" #base name for trained model
+```
+
+
+```{r}
+# colors for species
+cols4species <- hue_pal()(5)
+names(cols4species) <- sort(c("Mouse", "Rat", "Opossum", "Human", "Rabbit"))
+
+# colors for organs
+# specify colors for each tissue
+col4organs <- RColorBrewer::brewer.pal("Dark2", n= 5)
+names(col4organs) <- c("Brain", "Cerebellum", "Heart", "Liver", "Testis")
+```
+
+# Load data
+```{r load_data}
+# load normalized gene expression data and time information
+# obtained in preprocess_data.R
+evodevo <- load_evodevo_data(datadir, metadir, countdir, save = TRUE)
+expression_all_species <- evodevo$expression_all_species
+time_points <- evodevo$time_points
+```
+
+
+# Prepare and train MOFA
+*Create the MOFA object*
+```{r, message=FALSE, warning=FALSE}
+spec <-  c("Mouse", "Rabbit", "Rat", "Human", "Opossum")
+vws <- c("Brain", "Cerebellum", "Heart", "Liver", "Testis")
+traindata_dir <- "data/input_data/all_unmatched/"
+
+# get dataframe for MOFA input
+df_mofa <- get_data4MOFA(matched_times = FALSE,
+                         species2include = spec,
+                         views2include = vws)
+df_mofa$group <- factor(df_mofa$group, levels = spec)
+
+# create the MOFA object and add times as covariate
+MOFAobject_untrained <- create_mofa(data = df_mofa)
+MOFAobject_untrained <- set_covariates(MOFAobject_untrained,
+                                       covariates = "time")
+MOFAobject_untrained
+
+# export as csv for training in python
+if(!dir.exists(traindata_dir)){
+  export_data(model = MOFAobject_untrained, dir = traindata_dir)
+}
+```
+
+
+**Show data and time covariate**
+```{r data_overview, fig.width=10, fig.height=7}
+gg_input <- plot_data_overview(MOFAobject_untrained,
+                               colors = col4organs,
+                               show_covariate = TRUE,
+                               show_dimensions = FALSE) 
+# more customized plot
+plot_data_overview_custom(MOFAobject_untrained,
+                          colors = col4organs,
+                          show_dimensions = FALSE)
+```
+
+**Prepare the MOFA object**
+```{r MOFA_options}
+data_opts <- get_default_data_options(MOFAobject_untrained)
+
+model_opts <- get_default_model_options(MOFAobject_untrained)
+model_opts$num_factors <- 5
+
+smooth_opts <- get_default_smooth_options(MOFAobject_untrained)
+smooth_opts$warping <- TRUE
+smooth_opts$warping_ref <- "Mouse"
+
+train_opts <- get_default_training_options(MOFAobject_untrained)
+train_opts$seed <- 2020
+```
+
+```{r prepare_MOFA, message = FALSE}
+MOFAobject_untrained <- prepare_mofa(
+  object = MOFAobject_untrained,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts,
+  smooth_options = smooth_opts
+) 
+```
+
+**Train the MOFA model**
+```{r}
+filename <- paste0(base_nm,"_k",model_opts$num_factors,"-seed_", train_opts$seed,".hdf5")
+outfile <- file.path(outdir, filename)
+```
+
+```{r train_MOFA, eval = FALSE}
+# MOFAobject <- run_mofa(MOFAobject_untrained, outfile = outfile)
+```
+
+For all further analysis we will use a pre-trained model. If this is not yet available, we can run `train_evodevo.py` (or `submit_training.sh`) to train the model from python on the data exported above from the untrained MOFA object. Once the trained models are obtained, we can continue with the downstream analysis below.
+```{r}
+knitr::opts_chunk$set(eval = file.exists(outfile), echo = file.exists(outfile))
+```
+
+# Load trained model
+```{r load_model, warning = FALSE}
+MOFAobject <- load_model(outfile, load_interpol_Z = TRUE)
+
+# put names back on object
+features_names(MOFAobject) <- features_names(MOFAobject_untrained)
+samples_names(MOFAobject) <- samples_names(MOFAobject_untrained)
+
+# add columns with nice name to metadata (required to keep group)
+df <- samples_metadata(MOFAobject)
+samples_metadata(MOFAobject) <- mutate(df, species = group)
+```
+
+
+# Downsample stability
+To test whether the five components are stably inferred, we down-sample repeatedly 1,3 or 5 time points at random in each organ and species.
+The models on down-sampled data were trained using `train_evodevo.py` (with settings as specified in `submit_training.sh`) and are loaded here into R. Comparing the factor values on the common samples shows 5 clear blocks corresponding to the 5 factor in the model trained on all data.
+```{r downsample, warning=FALSE, message=FALSE}
+# base name of files of models trained on downsampled data
+nm <- paste0(base_nm,"_k",model_opts$num_factors,"-")
+fls <- list.files(outdir)
+fls <- fls[grepl(paste0("^",nm,"N"), fls)]
+
+# load down-sampled (masked) models and add the model trained on the full data
+list_models <- lapply(fls, function(fnm) { 
+  mm <- load_model(file.path(outdir, fnm))
+  samples_names(mm) <- samples_names(MOFAobject_untrained)
+  mm
+})
+list_models <- c(list_models, MOFAobject)
+names(list_models) <- c(gsub(paste0("^",nm),"", fls), "full")
+
+# annotate factors by factor name and down-sampling
+Ndown <- gsub("-sample_seed_.*", "",names(list_models))
+Ndown <- ifelse(Ndown == "seed_2020.hdf5", "full", Ndown)
+Ks <- sapply(list_models, function(m) m@dimensions$K)
+df_anno <- data.frame(Ndown = lapply(seq_along(Ks),
+                                     function(i) rep(Ndown[i], Ks[i])) %>% unlist())
+df_anno$Factor <-  lapply(seq_along(Ks),
+                          function(i) paste("Factor", seq_len(Ks[i]), sep = "")) %>%
+  unlist()
+rownames(df_anno) <- lapply(seq_along(Ks),
+                            function(i) paste(rep(names(list_models)[i],
+                                                                 Ks[i]), "_Factor", seq_len(Ks[i]), sep = "")) %>% unlist()
+
+# make heatmap of factor values for comparison
+compare_factors(list_models, show_rownames = F,
+                show_colnames = F, annotation_row = df_anno)  
+```
+
+# Factor overview and visualization
+
+## Variance decomposition and factor correlation
+To obtain a first overview of the factors we can take a look at the variance that a factor explains in each organ and species.
+```{r variance_decomposition}
+p <- plot_variance_explained(MOFAobject, plot_total = T)
+ggr2 <- p[[1]] + theme(axis.text.x = element_text(angle = 90))
+ggr2_total <- p[[2]] + theme(axis.text.x = element_text(angle = 90))
+ggr2
+```
+
+## Factors versus developmental time (before/after alignement)
+To look at the inferred factors, we can plot them against the developmental stages. Before alignment, the timing of common developmental process does not match, after alignment, we see a clearer match.
+```{r aligned_vs_unaligned}
+# Factors versus developmental time (before alignment)
+gg_fac_unaligned <- plot_factors_vs_cov(MOFAobject,
+                                        color_by = "species",
+                                        covariate = "time",
+                                        scale = FALSE,
+                                        warped = FALSE) +
+  stat_summary(fun = "mean", aes(col = color_by),
+               geom= "line", show_guide = FALSE) +
+  xlab("Unaligned developmental times") +
+  ylab("factor value") +
+  theme(legend.position = "top")
+
+# Factors versus developmental time (after alignment)
+gg_fac_aligned <- plot_factors_vs_cov(MOFAobject,
+                                      color_by = "species",
+                                      covariate = "time",
+                                      scale = FALSE) +
+  stat_summary(fun = "mean", aes(col = color_by),
+               geom= "line", show_guide = FALSE) +
+  xlab("Aligned developmental times") +
+  ylab("factor value")
+
+
+gg_fac_alignemnt <- plot_grid(get_legend(gg_fac_unaligned),
+                              gg_fac_unaligned + guides(fill = FALSE),
+                              gg_fac_aligned + guides(fill = FALSE),
+                              ncol =1, axis = "r",
+                              rel_heights = c(0.2,1,1),
+                              labels = c("","A","B"))
+gg_fac_alignemnt
+```
+
+## Factor scatterplot
+A scatterplot of the first two factors shows the embedding of timepoint-species combination in the latent space. Again we see, that the aligned times show a gradual development along the developmental trajectory captured by the conserved developmental programs on Factors 1 and 2.
+```{r scatter, fig.width=9, fig.height=6}
+gg_aligned <- plot_factors(MOFAobject, 1:2,
+                           color_by = "time_warped",
+                           dot_size = 2) +
+   coord_fixed() + 
+  guides(fill = guide_colorbar(title = "Aligned times")) +
+  theme(legend.position = "right")
+gg_unaligned <- plot_factors(MOFAobject, 1:2,
+                             color_by = "time", dot_size = 2) +
+   coord_fixed() + 
+  guides(fill = guide_colorbar(title = "Unaligned times")) +
+  theme(legend.position = "right")
+
+gg_species <-  plot_factors(MOFAobject, 1:2, color_by = "species",
+                            dot_size = 2) + coord_fixed() + 
+  theme(legend.position = "right")  
+
+gg_scatter <- plot_grid(
+  gg_unaligned,
+  gg_aligned,
+  gg_species,
+  labels = LETTERS[1:3],
+  nrow = 2, align = "hv", axis = "tlrb"
+)
+
+gg_scatter
+```
+
+# Alignment
+Next, we further look into the alignment that was learnt by the model by plotting the mapping of mouse developmental stages to the stages of other species and compare this to the mapping of developmental stages found by [Cardoso-Moreira et al.](https://www.nature.com/articles/s41586-019-1338-5).
+
+```{r aligned, fig.width=7, fig.height=6}
+# plot the alignment learnt by the model
+df <- samples_metadata(MOFAobject)
+df <- separate(df, sample, c("time_id", "specie"), sep = "_")
+
+# add corresponding mouse stage to the samples meta data based
+# on the inferred warped time
+levels_mouse <- df %>% filter(species == "Mouse") %>%
+  arrange(time) %>% select(time_id) %>% unlist()
+df <- mutate(df, id_mouse_sorted = factor(levels_mouse[time_warped],
+                                   levels = levels_mouse)) %>%
+  arrange(species, time)
+
+# sort time ids by the correct chronological order of times per species
+levels_times = df %>% arrange(species, time) %>% select(time_id, group) %>%
+  mutate(times =paste(substr(group,1,3), time_id, sep ="-")) %>% select(times) %>% unlist()
+df$time_id_sorted <- factor(paste(substr(df$group,1,3), df$time_id, sep ="-"),
+                         levels = levels_times)
+
+# add correspondences from  Cardoso-Moreira et al.
+df_paper_times <- get_paper_times(metadir)
+
+# sort time ids by the correct chronological order of times per species
+df_paper_times$id_mouse_sorted <-  factor(df_paper_times$id_mouse,
+                                          levels = levels_mouse)
+df_paper_times$time_id_sorted <- factor(paste(substr(df_paper_times$group,1,3),
+                                              df_paper_times$id_paper, sep ="-"),
+                                     levels = levels_times)
+
+dfsub <- df %>%
+  select(time_id_sorted, id_mouse_sorted, group) %>%
+  mutate(mapping = "MEFISTO")
+df_paper_times <- df_paper_times %>%
+  select(time_id_sorted, id_mouse_sorted, group) %>%
+  mutate(mapping = "Cardoso-Moreira et al.")
+df_joint <- rbind(dfsub, df_paper_times)
+df_joint %<>% mutate(color = ifelse(mapping == "MEFISTO",
+                                    as.character(group), "black"))
+df_joint %<>% filter(group != "Mouse")
+
+# plot learnt stage correspondences between species
+gg_align_labelled <-  df_joint %>%
+  ggplot(aes(x= time_id_sorted, y= id_mouse_sorted,
+             col = group, shape = mapping)) +
+  geom_point(data = filter(df_joint, mapping == "MEFISTO"))  +
+  geom_point(data = filter(df_joint,
+                           mapping == "Cardoso-Moreira et al."),
+             color = "black", alpha= 0.8, size = 0.7)  +
+  theme_bw() +
+  ylab("Corres. mouse stage") +
+  scale_x_discrete(labels =  function(x) gsub(".*-", "", x)) +
+  xlab("Developmental stage") +
+  facet_wrap(~group, scales = "free_x", nrow = 2) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust =0, hjust = 1),
+        legend.position = "top") +
+  scale_color_manual(values = c(cols4species, "black" = "black"))
+gg_align_labelled
+```
+
+# Smoothness and sharedness of factors: Investigating the learnt hyper parameters
+
+In addition to the factor values and the alignment the model also inferred an underlying Gaussian process that generated these values. By looking into it we can extract information on the smoothness of each factor, i.e. how smoothly it varies along developmental time, as well as the sharedness of each factor, i.e. how much the species (groups) show the same underlying developmental pattern and how the shape of their developmental trajectory related to a given developmental module (Factor) clusters between species.
+
+## Scale & Lengthscale
+The scale and lengthscale parameters of the Gaussian process capture the smoothness of the model. A scale of 1 indicates high smoothness, a scale of 0 stochastic variation independent of time. Here, all factors show a very high degree of smoothness.
+```{r}
+get_lengthscales(MOFAobject)
+get_scales(MOFAobject)
+```
+
+## Group kernels
+The group kernel of the Gaussian process can give us insights into the extent to which a temporal pattern is shared across species for the developmental module captured by each process. Here, we see a strong clustering of the first processes, indicating that these are conserved in evolution of the species, while the last two processes show distinct clusters.
+```{r}
+plot_group_kernel(MOFAobject, factors = "all",
+                  cellheight =  15, cellwidth = 15,
+                  treeheight_col = 3, treeheight_row = 3)
+```
+
+```{r group_kernel, fig.width=10, fig.height=2, echo = FALSE}
+# We can use the code above, here we make some more custom plot
+Kgs <- get_group_kernel(MOFAobject)
+
+hm_Kgs <- lapply(c("legend", factors_names(MOFAobject)), function(i){
+  idx <- i
+  if (idx == "legend"){
+    plot_legend <- TRUE
+    i<-1
+    hm <- my_heatmap(Kgs[[i]], midpoint = 0,
+                     min_c = -1, max_c = 1,
+                   silent =TRUE, treeheight_row =0.1,
+                   treeheight_col =0.1, main = "",
+                   legend = plot_legend, fontsize =9,
+                   cellheight= 1, show_rownames = FALSE)
+  } else {
+    plot_legend <- FALSE
+    hm <- my_heatmap(Kgs[[i]], midpoint = 0,
+                     min_c = -1, max_c = 1,
+                     silent =TRUE, treeheight_row =3,
+                     treeheight_col =3, main = "",
+                     legend = plot_legend, fontsize =9,
+                     show_rownames = FALSE)
+  }
+   if (idx == "legend"){
+    return(hm$gtable$grobs[[6]])
+  } else
+    return(hm$gtable)
+})
+
+gghm <-cowplot::plot_grid(plotlist = hm_Kgs, nrow = 1,
+                          rel_widths = c(0.2,1,1,1,1,1),
+                          scale = 0.95)
+```
+
+
+## Smoothness score
+For visualization we visualize the scale of the Gaussian process as a smoothness score in a barplot for each factor.
+```{r smooth, fig.height=0.5, fig.width=5}
+gg_smooth <- plot_smoothness(MOFAobject) +
+  theme(strip.text = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "cm"))
+```
+
+
+## Sharedness score
+For visualization we calculate the distance of the group kernel to the identity matrix as a sharedness score in a barplot for each factor..
+```{r shared, fig.height=0.5, fig.width=5}
+gg_shared <- plot_sharedness(MOFAobject) +
+  theme(strip.text = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "cm"))
+```
+
+
+# Interpolation
+Using the underlying Gaussian process for each factor we can interpolate to unseen time points for species that are missing data in these time points or intermediate time points and provide both a prediction as well as uncertainties. Th interpolated time points are already present in the trained model object and have been calculated in python (see  `train_evodevo.py`). 
+
+```{r interpol, fig.width=10, fig.height=3}
+# obtain interpolated factors from the model
+df <- get_interpolated_factors(MOFAobject,
+                               as.data.frame = TRUE)
+df %<>% mutate(sd = sqrt(variance),
+               ymin = mean -1.96 * sd,
+               ymax = mean + 1.96 * sd)
+df %<>% rename(species = group)
+
+# add the facotr values of the observed time point and species to the plot
+df_observed <- plot_factors_vs_cov(MOFAobject,
+                                   covariate = "time",
+                                   return_data = TRUE)
+df_observed %<>% rename(species = group)
+
+# plot
+gg_interpol <- ggplot(df, aes(x= time, y = mean, col = species)) +
+  geom_point(data = df_observed, aes(x= value.covariate, 
+                                     y = value.factor, col = species),
+             size = 1) +
+  geom_line(aes(y=mean,  col = species)) +
+  geom_ribbon(aes(ymin=ymin, ymax = ymax, fill = species),
+              alpha = .2, col = "gray", size = 0.1) +
+  facet_wrap(~ factor, nrow = 1) + theme_classic() +
+  theme(legend.position = "top") +
+  xlab("Learnt common developmental time") +
+  ylab('Latent value') + 
+  theme(axis.ticks.x = element_blank()) +
+  scale_x_continuous(breaks = c(1.5,13.5),
+                     labels = c("early", "late"))
+
+gg_interpol
+```
+
+
+# Main figure
+For completeness, we here reproduce the main figure of the manuscript.
+```{r main, fig.width=10, fig.height=14}
+# Factor part of figure
+ggfac <- plot_grid(gg_interpol + ylim(c(-4,7)),
+                   gg_smooth, gg_shared, 
+                   ncol =1, align = "hv", axis = "lr",
+                   rel_heights = c(1.1,0.05, 0.05),
+                   labels = c("D","",""))
+
+# Adding heatmaps
+gg_fac_all <- plot_grid(ggfac,
+                        gghm + theme(plot.margin = unit(c(0.5,0,0,0), "cm")),
+                        ncol =1, align = "hv", axis = "r",
+                        rel_heights = c(1.2,0.9),
+                        labels = c("","E"))
+
+# Combine R2 plots
+ggr2_joint <- plot_grid(ggr2_total +
+                          theme(axis.text.x = element_blank(),
+                                plot.margin = unit(c(0,0,0,0), "cm"),
+                                text = element_text(size = 12)) +
+                          ylab("Var. (%)"),
+                        ggr2 +
+                          theme(strip.text = element_blank(),
+                                plot.margin = unit(c(-2.5,0,-0.5,0), "cm"),
+                                axis.text.x = element_text(vjust=0, hjust =1),
+                                text = element_text(size = 13)),
+                        labels = c("",""), ncol = 1, scale =1,
+                        axis = "blr", align = "hv", rel_heights = c(0.3,0.35))
+
+# input data and scatter plot (note the input i replace by an illustrationin the manuscript)
+gg_up <- plot_grid(gg_input, gg_aligned,
+                   ncol = 2, labels = c("A", "B"),
+                   scale = 0.99, rel_widths = c(1.5,1))
+
+# combine all
+plot_grid(gg_up,
+          ggr2_joint,
+          gg_fac_all,
+          ncol = 1, labels = c("","C", ""),
+          scale = 0.99, rel_heights = c(1, 1, 2))
+```
+
+
+# Factor weights: Gene set enrichment analysis and inspection of genes with top weights per factor
+To obtain insights into the molecular signatues associated with each factor in each organ, we can inspect the genes that have high weights on the factors as well as carry out an enrichment analysis to obtain gene sets that are associated to the process.
+
+## Obtain metadata on genes
+```{r}
+# add gene symbols to the feature names (ensemleIDs) of the model
+gene_description <- read.delim(file.path(metadir,"Hsapiens_genes_BioMart.75.txt"), 
+                       sep="\t", header = TRUE)
+gene_description <- select(gene_description, "ens_id", "symbol", "description")
+organs <- c("Brain", "Cerebellum", "Heart", "Liver", "Testis")
+
+# add symbols as feature names to a copy of the MOFA object
+MOFAobject_symbol <- MOFAobject
+features_names(MOFAobject_symbol) <- lapply(
+  features_names(MOFAobject_symbol), function(nm) {
+    nmnew <- data.frame(ens_id = gsub("_.*","",nm))
+    df <- left_join(nmnew, gene_description, by = "ens_id")
+    df <- mutate(df, name = ifelse(!is.na(symbol), symbol, ens_id))
+    df$name
+    }) 
+```
+
+
+Let's have a look at the gene expression trajectories of the genes with highest weight per factor. As not all factors are active in all organs, we look at those organs, where the factor explains most variation.
+
+## Factor 1
+
+Top weights per organ:
+```{r Fac1_supp, fig.width=7, fig.height=7}
+calculate_variance_explained(MOFAobject_symbol,
+                             factors = 1)$r2_per_factor %>%
+  Reduce(rbind,.) %>% apply(.,2,max) %>% sort(decreasing = TRUE)
+
+make_fig_weight_factor(MOFAobject_symbol,
+                       views = c("Brain", "Cerebellum", "Heart"),
+                       fac = 1)
+```
+
+## Factor 2
+
+Top weights per organ:
+```{r Fac2_supp, fig.width=7, fig.height=7}
+calculate_variance_explained(MOFAobject_symbol,
+                             factors = 2)$r2_per_factor %>%
+  Reduce(rbind,.) %>% apply(.,2,max) %>% sort(decreasing = TRUE)
+
+make_fig_weight_factor(MOFAobject_symbol,
+                       views = c("Brain", "Liver", "Heart"),
+                       fac = 2)
+```
+
+## Factor 3
+
+Top weights per organ:
+```{r Fac3_supp, fig.width=5, fig.height=5}
+calculate_variance_explained(MOFAobject_symbol,
+                             factors = 3)$r2_per_factor %>%
+  Reduce(rbind,.) %>% apply(.,2,max) %>% sort(decreasing = TRUE)
+
+make_fig_weight_factor(MOFAobject_symbol,
+                       views = c("Testis"),
+                       fac = 3)
+```
+
+## Factor 4
+Top weights per organ:
+```{r Fac4_supp, fig.width=7, fig.height=7}
+calculate_variance_explained(MOFAobject_symbol,
+                             factors = 4)$r2_per_factor %>%
+  Reduce(rbind,.) %>% apply(.,2,max) %>% sort(decreasing = TRUE)
+
+make_fig_weight_factor(MOFAobject_symbol,
+                       views = c("Cerebellum", "Liver", "Heart"),
+                       fac = 4)
+```
+
+
+## Factor 5
+Top weights per organ:
+```{r Fac5_supp, fig.width=7, fig.height=7}
+calculate_variance_explained(MOFAobject_symbol,
+                             factors = 5)$r2_per_factor %>%
+  Reduce(rbind,.) %>% apply(.,2,max) %>% sort(decreasing = TRUE)
+
+make_fig_weight_factor(MOFAobject_symbol,
+                       views = c("Cerebellum", "Brain", "Heart"),
+                       fac = 5)
+```
+
+
+## Trajectory changes: Comparison to [Cardoso-Moreira et al.](https://www.nature.com/articles/s41586-019-1338-5) 
+Factors 4 and 5  capture processes that are specific to human and opossum. 
+We compare the weights of these genes therefore to the genes, that have previously been identified as having changed trajectories on the evolutionary branch separating opossum from the remaining species (HMRRab_O) or human from rodents and rabbit (MRRab_H).
+These are provided as Supplementary Table (file name: [41586_2019_1338_MOESM2_ESM.xlsx](https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-019-1338-5/MediaObjects/41586_2019_1338_MOESM2_ESM.xlsx)) in the original publication.
+
+### Human factor
+```{r comp4}
+# obtain weights of human factor
+df_weights4 <- get_weights(MOFAobject, factors = 4, as.data.frame = T) %>%
+    mutate(ens_id = gsub("_.*","",feature))
+
+# obtain genes identified as MRRab_H in Cardoso-Moreira et al. in all 5 organs
+diffgenes <- lapply(1:5, function(i){
+  df <- read.xlsx(paste0(metadir, "41586_2019_1338_MOESM2_ESM.xlsx"),
+                        sheet = 14 + i, startRow = 3) %>%
+  filter(comparison == "MRRab_H",  # subset to genes with differences human - MRRab
+         Human_ID %in% df_weights4$ens_id)  # subset to orthologues genes in MOFA
+  df$view <- organs[i]
+  df$id <- paste(df$Human_ID, df$view, sep ="-")
+  df
+}) %>% bind_rows()
+
+# annotate weights in MOFA with whether or not they have been identified as MRRab_H
+df_weights4 <- df_weights4 %>%
+  mutate(id = paste(ens_id, view, sep ="-")) %>%
+  mutate(MRRab_H = ifelse(id %in% diffgenes$id, T, F)) 
+
+# make a violin plot
+df_weights4 %>% filter(view %in% organs) %>%
+ggplot(aes(x=MRRab_H, y = (value), fill = MRRab_H)) +
+  geom_violin() + facet_wrap(~view) +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("grey", "forestgreen")) +
+  theme_bw()+ ylab("factor value") +
+  xlab("Previously identified trajectory changes between human \n compared to mouse, rat and rabbit ")
+```
+
+We see a clear enrichment here of high (absolute) weights for previously identified genes. Note that we do not expect to obtain an exact match here, as previously genes were identified based on a clustering approach and scaled. Here, genes with large variation differences will be more easily identified than those with small variation as no scaling is applied. Let's take some examples of genes, where our model and Cardoso-Moreira et al. disagree.
+
+```{r zoomin4}
+# genes that are MRRab_H but low weight in MOFA
+vw <- get_variance_explained(MOFAobject)$r2_per_factor %>%
+  Reduce(pmax, .) %>% .[4,] %>% which.max() %>% names() 
+feat2plot <- df_weights4 %>%  filter(MRRab_H, view == vw) %>%
+  arrange(abs(value)) %>% head(6) %>% select(feature) %>%
+  unlist() %>% as.character()
+plot_data_vs_cov(MOFAobject, features = feat2plot,
+                 view = vw, factor = 4, covariate = "time") +
+  guides(col = FALSE)+
+  stat_summary(fun = "mean", geom = "line", aes(col = color_by))
+
+# genes that are not MRRab_H but high weight in MOFA
+feat2plot <- df_weights4 %>%
+  filter(!MRRab_H, view == vw) %>% arrange(-abs(value)) %>%
+  head(6) %>% select(feature) %>% unlist() %>% as.character()
+plot_data_vs_cov(MOFAobject, features = feat2plot, view = vw,
+                 factor = 4, covariate = "time") +
+  guides(col = FALSE) +
+  stat_summary(fun = "mean", geom = "line", aes(col = color_by)) + 
+  scale_color_manual(values = cols4species)
+```
+
+### Opossum factor
+```{r comp5}
+# obtain weights of opossum factor
+df_weights5 <- get_weights(MOFAobject, factors = 5, as.data.frame = T) %>%
+    mutate(ens_id = gsub("_.*","",feature)) 
+  
+# obtain genes identified as MRRabH_O in Cardoso-Moreira et al. in all 5 organs
+diffgenes <- lapply(1:5, function(i){
+  df <- read.xlsx(paste0(metadir, "41586_2019_1338_MOESM2_ESM.xlsx"),
+                        sheet = 14 + i, startRow = 3) %>%
+  filter(comparison == "MRRabH_O",  # subset to genes with differences human - MRRab
+         Human_ID %in% df_weights5$ens_id)  # subset to orthologue genes in MOFA
+  df$view <- organs[i]
+  df$id <- paste(df$Human_ID, df$view, sep ="-")
+  df
+}) %>% bind_rows()
+
+# annotate weights in MOFA with whether or not they have been identified as MRRabH_O
+df_weights5 <- df_weights5 %>%
+  mutate(id = paste(ens_id, view, sep ="-")) %>%
+  mutate(MRRabH_O = ifelse(id %in% diffgenes$id, T, F)) 
+
+# make a violin plot
+df_weights5 %>% filter(view %in% organs) %>%
+ggplot(aes(x=MRRabH_O, y = (value), fill = MRRabH_O)) +
+  geom_violin() + facet_wrap(~view) +
+  geom_boxplot(width=0.1) +
+  scale_fill_manual(values = c("grey", "forestgreen"))+
+  theme_bw() + ylab("factor value")  +
+  xlab("Previously identified trajectory changes between opossum \n compared to human, mouse, rat and rabbit ")
+
+```
+
+We see a clear enrichment here for high (absolute) weights for previously identified genes.
+As above, we can a look at some examples of genes, where our model and Cardoso-Moreira et al. disagree.
+
+```{r zoomin5}
+# genes that are MRRabH_O but low weight in MOFA
+vw <- get_variance_explained(MOFAobject)$r2_per_factor %>%
+  Reduce(pmax, .) %>% .[5,] %>% which.max() %>% names() 
+feat2plot <- df_weights5 %>%  filter(MRRabH_O, view == vw) %>%
+  arrange(abs(value)) %>% head(6) %>% 
+  select(feature) %>% unlist() %>% as.character()
+plot_data_vs_cov(MOFAobject, features = feat2plot,
+                 view = vw, factor = 5, covariate = "time") +
+  guides(col = FALSE) +
+  stat_summary(fun = "mean", geom = "line", aes(col = color_by))
+
+# genes that are not MRRabH_O but high weight in MOFA
+feat2plot <- df_weights5 %>%
+  filter(!MRRabH_O, view == vw) %>%
+  arrange(-abs(value)) %>% head(6) %>%
+  select(feature) %>% unlist() %>% as.character()
+plot_data_vs_cov(MOFAobject, features = feat2plot,
+                 view = vw, factor = 5,
+                 covariate = "time") +
+  guides(col = FALSE) +
+  stat_summary(fun = "mean", geom = "line", aes(col = color_by))
+```
+
+
+## Gene set enrichment analysis
+To aggregate information on factors from individual genes to gene sets we can use enrichment analysis on each factor and for each organ.
+```{r}
+# get gene set
+library(MOFAdata)
+data("reactomeGS")
+
+# remove organ part from feature names in MOFA for match with feature names in reactome GS
+MOFAobject_renamed <- MOFAobject
+features_names(MOFAobject_renamed) <- lapply(features_names(MOFAobject_renamed), function(l) gsub("_.*","", l))
+
+# conduct enrichment analysis
+df_enrich <- lapply(views_names(MOFAobject_renamed), function(t) {
+  enrichment.parametric <- run_enrichment(MOFAobject_renamed,
+    view = t, factors = "all",
+    feature.sets = reactomeGS,
+    statistical.test = "parametric",
+    sign = "all"
+  )
+  pvalues_view <- data.frame(enrichment.parametric$pval.adj)
+  pvalues_view %>%
+    rownames_to_column(var = "pathway") %>%
+    mutate(view = t)
+
+}) %>% bind_rows()
+
+df_enrich %<>% gather(starts_with("Factor"), value = "padj", key = "factor")
+```
+
+
+## Common signatures across organs
+
+### Common developmental program across organs
+Take a look at common gene set across organs for factor 1.
+```{r}
+# filter to view- factor combination that explain more than 5 % of variation in at least one species
+# plot gene sets enriched in at least 4 organs at an FDR of 5%
+gg_gsea <- plot_gsea_across_organs(object = MOFAobject, 
+                        df = df_enrich,
+                        fac = "Factor1",
+                        min_r2 = 5,
+                        Nmin = 4, alpha = 0.05,
+                        show_bar = TRUE) + 
+  scale_color_manual(values = col4organs) +
+  guides(col=FALSE) +
+  xlab("")
+```
+
+### Common genes with high weights across organs
+```{r}
+# get weights
+dfw <- get_weights(MOFAobject_symbol, factors = 1,
+                   as.data.frame = TRUE, views = 'all') %>%
+  mutate(feature = as.character(feature)) %>%
+  rename(organ = view)
+
+# summarize feature's score by mean accross organs
+summ <- dfw %>%
+  group_by(feature) %>%
+  summarise(mean_weight = mean(value)) %>%
+  ungroup() %>%
+  arrange(abs(mean_weight))
+
+df <- left_join(dfw, summ, by = c("feature"))
+
+# subset to 10 features with highest absolute mean weights across organs
+df <- df %>% 
+  mutate(feature = factor(feature, levels = (summ$feature))) %>%
+  slice_max(order_by = abs(mean_weight), n = 10 * 5)
+
+minx <- min(abs(df$value))
+maxx <- max(abs(df$value))
+
+# plot
+gg_summ <-  df %>%
+  ggplot(aes(x = abs(value), col = organ, y = feature)) +
+  geom_point() + facet_wrap(~factor, scales = "free_y") +
+  geom_boxplot(aes(x = abs(mean_weight)), col = "gray", alpha = 0.1) +
+  xlab("Absolute weight") + ylab("") +
+  theme_bw() + theme(strip.text = element_blank()) + 
+  scale_color_manual(values = col4organs) +
+  geom_text(x = round(maxx,1) + 0.2,
+            aes(label = ifelse(mean_weight <0, "(-)", "(+)")),
+            col = "black", size = 5) +
+  xlim(round(minx,1) -0.1, round(maxx,1) + 0.2)
+
+gg_summ
+```
+
+Plot the gene expression trajectries for these genes in all organs.
+```{r, fig.width = 10, fig.height=5}
+pl <- lapply(views_names(MOFAobject_symbol), function(m) {
+
+gg <- plot_data_vs_cov(MOFAobject_symbol, factor = 1,
+                 features = c("SOX11","IGF2BP1","KLF9"), 
+                 view = m, dot_size = 1, color_by = "species") +
+  facet_wrap(~feature, ncol = 1) +
+  stat_summary(geom = "line", aes(col = color_by), fun = "mean") +
+  guides(col = FALSE) +
+  theme(legend.position = "top",
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(colour = col4organs[m])) +
+  scale_x_continuous(breaks = c(1.5,13.5), labels = c("early", "late")) +
+  xlab("Developmental time")  + guides(fill = FALSE) 
+  if(m != views_names(MOFAobject_symbol)[3]){
+    gg <- gg + xlab("")
+  }
+gg
+})
+
+gg_pan <- plot_grid(plotlist = pl, nrow = 1)
+```
+
+```{r pan1, fig.width=12, fig.height=8}
+plot_grid(plot_grid(gg_gsea,
+                    gg_summ + theme(legend.position = "top"),
+                    ncol =2, labels = c("A", "B"),
+                    rel_widths = c(1.4, 1)),
+          gg_pan, ncol = 1, labels = c("", "C"))
+```
+
+
+# SessionInfo
+```{r export, echo = FALSE}
+# export some results for further analyses
+save(df_enrich, file = paste0(figdir,"/df_enrich-", Sys.Date(),".RData"))
+save(MOFAobject_symbol, file = paste0(figdir,"/MOFAobject_symbol-", Sys.Date(),".RData"))
+
+# Let's export the weights and enriched gene sets per organ.
+for (m in views_names(MOFAobject_renamed)){
+  df_enrich %>% filter(view == m) %>% arrange(factor, padj) %>% 
+  filter(padj < 0.05) %>% write.csv(., file = paste0(figdir,"/enriched_",m,".csv"))
+}
+
+for (m in views_names(MOFAobject_symbol)){
+  get_weights(MOFAobject_symbol, as.data.frame = TRUE) %>% filter(view == m) %>% 
+    group_by(factor) %>%
+    mutate(rank = rank(abs(value))) %>%
+    ungroup() %>%
+    arrange(factor, rank) %>%  write.csv(., file = paste0(figdir,"/weights_",m,".csv"))
+}
+```
+
+```{r}
+sessionInfo()
+```

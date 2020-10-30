@@ -1,0 +1,318 @@
+---
+title: "MEFISTO application to lonigtudinal microbiome data"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+library(MOFA2)
+library(magrittr)
+library(tidyverse)
+library(cowplot)
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_microbiome-", today, "/ECAM/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+```
+
+# Loading data
+## Load trained model
+Here we load the trained model, which was trained in `run_ECAM.py`. 
+We include interpolated data for missing time points.
+```{r}
+mm <- load_model("out/ECAM_microbiome-seed_2020.hdf5", load_interpol_Z = TRUE)
+mm
+```
+
+## Load meta data
+This file contains metadata on the samples, such as the delivery mode and diet of the babies.
+```{r}
+meta <- read.csv("data/processed_data/sample_metadata.csv")
+```
+
+Merge meta data with sample meta data of object
+```{r}
+# summarise on month level
+meta <- meta %>%
+  separate(X.SampleID, into = c("study_id", "group", "time_id"), sep = "\\.") %>%
+  select(group, delivery, diet, sex, antiexposedall, month)
+meta %<>% mutate(sample = paste0(group, "-", month, ".0"))
+meta <- meta %>% group_by(sample, group, month) %>%
+  summarise(diet = unique(diet),
+            sex = unique(sex),
+            delivery = unique(delivery),
+            antiexposedall = ifelse(any(antiexposedall == "y"), "y", "n")) %>%  
+  ungroup()
+
+# add information to samples_metadata of object
+samples_metadata(mm) <- left_join(samples_metadata(mm), meta,
+                                  by= c("group", "sample", "month"))
+
+# fill in group-level meta data for missing time points (same mode of delivery, diet and sex)
+samples_metadata(mm) <- samples_metadata(mm) %>%
+  group_by(group) %>%
+  mutate(delivery = unique(delivery[!is.na(delivery)]),
+         sex = unique(sex[!is.na(sex)]),
+         diet = unique(diet[!is.na(diet)])) %>% ungroup() 
+```
+
+# Variance explained
+Let's take a look in which groups each factor explains variation
+```{r}
+plot_variance_explained(mm, split_by = "view", x = "group") +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+# Factor along time
+## Colored by devlivery mode
+```{r}
+df <- plot_factors_vs_cov(mm, color_by = "delivery", return_data = TRUE)
+cols <- RColorBrewer::brewer.pal(8, "Dark2")
+cols4delivery <- c("#e6ab02", "#d95f02")
+names(cols4delivery) <- c("Cesarean", "Vaginal")
+gg_delivery <- ggplot(df, aes(x=value.covariate, y = value.factor, color = color_by)) +
+  geom_point(size=0.3, alpha =0.3) + facet_wrap(~factor) +
+  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  scale_color_manual(values = cols4delivery) +
+  xlab("month of life") + guides(col = FALSE) +
+  theme_bw() + ylab("Factor value")
+gg_delivery
+```
+
+## Colored by diet
+```{r}
+cols4diet <- c("#1f78b4", "#b2df8a")
+names(cols4diet) <- c("fd", "bd")
+df <- plot_factors_vs_cov(mm, color_by = "diet", return_data = TRUE)
+gg_diet <- ggplot(df, aes(x=value.covariate, y = value.factor, color = color_by)) +
+  geom_point(size=0.3, alpha =0.3) + facet_wrap(~factor)+
+  stat_summary(aes(group = color_by, col = color_by), geom = "line") +
+  scale_color_manual(values = cols4diet) +
+  xlab("month of life") + guides(col = FALSE) +
+  theme_bw() + ylab("Factor value")
+gg_diet
+```
+
+Combine the two plots.
+```{r}
+gg_fac <- cowplot::plot_grid(gg_delivery, gg_diet,
+                             ncol = 1, axis = "lr", align = "vh", labels = LETTERS[1:2])
+```
+
+# Clustering of babies per factor
+Next we can look into the clustering of babies on each factor.
+```{r}
+# get metadata of babies for annotation of groups in heatmap
+df_anno <- samples_metadata(mm) %>% as.tibble() %>% 
+  group_by(group) %>%
+  summarise(diet = unique(diet),
+            sex = unique(sex),
+            delivery = unique(delivery),
+            antiexposedall = ifelse(any(antiexposedall == "y", na.rm = TRUE), "y", "n")) %>%
+  select(group, delivery, diet, sex, antiexposedall) %>% #.[!duplicated(.),] %>% 
+  ungroup() %>%
+  column_to_rownames("group") %>% rename(antiexposed = antiexposedall)
+
+# set colors
+anno_col <- list(diet = cols4diet,
+                 delivery = cols4delivery,
+                 sex = c(Female = "pink", Male = "lightblue"),
+                 antiexposed = c(y = 'black', n= "white"))
+
+wd <- 3.5
+gg1 <- plot_group_kernel(mm, factors = 1, show_rownames = FALSE, show_colnames = FALSE,
+                  annotation_row = df_anno,
+                  annotation_names_row = FALSE,
+                  annotation_legend= FALSE, annotation_colors=anno_col,
+                  treeheight_row =5, treeheight_col =5,
+                  main = "", legend = FALSE, fontsize =9,
+                  cellheight = wd, cellwidth = wd)
+gg2 <- plot_group_kernel(mm, factors = 2, show_rownames = FALSE, show_colnames = FALSE,
+                  annotation_row = df_anno,
+                  annotation_names_row = FALSE,
+                  annotation_legend= TRUE, annotation_colors=anno_col,
+                  treeheight_row =5, treeheight_col =5,
+                  main = "", legend = FALSE, fontsize =9,
+                  cellheight = wd, cellwidth = wd)
+
+# combine plots
+gghm <- cowplot::plot_grid(gg1, gg2, nrow = 1,
+                          scale = 0.9, rel_widths = c(0.75, 1))
+gghm
+```
+
+Factor 1 shows a distinct cluster of babies that were all born by vaginal delivery.
+
+# Smoothness and sharedness of factors
+## Smoothness bars
+```{r, fig.height=1}
+gg_bar <- plot_smoothness(mm)
+```
+
+## Sharedness bars
+```{r, fig.height=1}
+gg_shared <- plot_sharedness(mm)
+```
+
+# Interpolation
+We can use the model for interpolation to missing months. We do this here for a subset of babies
+```{r interpol, fig.width=6, fig.height=3}
+df_observed <- plot_factors_vs_cov(mm, covariate = "month", return_data = TRUE)
+df <- get_interpolated_factors(mm, as.data.frame = TRUE)
+df %<>% mutate(sd = sqrt(variance), ymin = mean -1.96 * sd, ymax = mean + 1.96 * sd)
+df %<>% left_join(samples_metadata(mm), by = c("group", "month"))
+df %<>% left_join(df_observed, by = c("sample", "group", "month" = "value.covariate", "factor"))
+gg_interpol <- df %>% filter(factor == "Factor1",
+                             group %in% c("C001", "C002", "C004", "C005",
+                                          "C006", "C008", "C009", "C010", "C024", "C042")) %>%
+  ggplot(aes(x=month, y = mean, col = group)) +
+  geom_point(aes(x= month, y = value.factor, col = group, shape = antiexposedall), size = 1) +
+  geom_line(aes(y=mean,  col = group)) +
+  geom_ribbon(aes(ymin=ymin, ymax = ymax, fill = group),
+              alpha = .2, col = "gray", size = 0.1) +
+  facet_wrap(~ delivery + factor, ncol = 2) + theme_classic() +
+  guides(col=FALSE, fill = FALSE) + ylab('Factor value')
+gg_interpol
+```
+
+# Scatterplot
+We can also look at the factor values on the sample level.
+Here each dot correspond to one time-point-baby combination.
+```{r scatter, fig.width=9, fig.height=3.5}
+gg_scatter <- plot_grid(
+plot_factors(mm, color_by = "delivery") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = cols4delivery),
+plot_factors(mm, color_by = "diet") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = cols4diet),
+plot_factors(mm, color_by = "month") +
+  theme(legend.position = "top"),
+nrow = 1, align = "h", axis = "tb")
+
+gg_scatter
+```
+
+# Weights
+Next we have a look at the microbial species associated with the two factors.
+For this we have a look at the weights of each factor.
+
+First we load the meta information on the features.
+```{r}
+taxonomy <- read.csv("data/processed_data/taxonomy.csv" )
+taxa <- taxonomy$Taxon
+names(taxa) <- taxonomy$Feature.ID
+features_names(mm) <- list(microbiome = taxa[features_names(mm)[[1]]])
+features_metadata(mm) <- separate(features_metadata(mm), col = feature, 
+                                  sep = ";",
+                                  into = c("kingdom", "phylum", "class",
+                                           "order", "family", "genus", "species"),
+                                  remove = FALSE)
+```
+
+Let's first have a look at the top positive and top negative species on factor 1.
+```{r}
+# top negative ones (more dominant in vaginal)
+get_weights(mm, factors = 1, as.data.frame = TRUE) %>%
+  arrange(value) %>% head(20) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+           remove = FALSE) %>% select(class, order, family, genus, species) 
+
+# top positive ones  (more dominant in C-section)
+get_weights(mm, factors = 1, as.data.frame = TRUE) %>%
+  arrange(-value) %>% head(20) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+           remove = FALSE) %>% select(class, order, family, genus, species) 
+```
+
+We now summarise this on the genus level.
+```{r w1}
+df_weights1 <- get_weights(mm, as.data.frame = T, factors = 1) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+           remove = FALSE)
+
+# filter out genera with missing genera information and shorten name
+df_weights1 %<>% filter(!is.na(genus), genus != "g__")
+df_weights1 %<>% mutate(genus = gsub("g__","", genus))
+df_weights1 %<>% mutate(genus = ifelse(genus == " Pseudoramibacter_Eubacterium",
+                                       "Pseudoramibacter_Eub.", genus))
+
+# summarize by mean weights across all species in the genus and 
+# filter to top 10 positive and negative ones
+df_top <- df_weights1 %>% group_by(genus) %>% 
+  summarize(mean_weight = mean(value)) %>%
+  ungroup() %>% 
+  # cesarean is linked to higher latent values
+  mutate(type = ifelse(mean_weight > 0, "Cesarean", "Vaginal")) %>%
+  group_by(type) %>%
+  slice_max(abs(mean_weight), n= 10) %>% ungroup() %>% arrange(mean_weight) %>%
+  mutate(genus = factor(genus, levels = .$genus))
+
+# plot
+gg_w1 <-  df_top %>% 
+  ggplot(aes(x= genus, y = mean_weight, fill = type)) + geom_bar(stat="identity") +
+  coord_flip() + theme_bw()  + scale_fill_manual(values = cols4delivery) +
+  theme(legend.position = "top") + xlab("") + guides(fill = guide_legend(title="")) +
+  geom_point(data = filter(df_weights1, genus %in% df_top$genus),
+             aes(x = genus, y = value), inherit.aes = FALSE, alpha = 0.3)  +
+  ylab("Weight (Factor 1)")
+gg_w1
+```
+
+Let's do the same for factor 2.
+```{r w2}
+df_weights2 <- get_weights(mm, as.data.frame = T, factors = 2) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order",
+                    "family", "genus", "species"),
+           remove = FALSE)
+
+# filter out genera with missing genera information
+df_weights2 %<>% filter(!is.na(genus), genus != "g__")
+df_weights2 %<>% mutate(genus = gsub("g__","", genus))
+
+# summarize by mean weights across all species in the genus and 
+# filter to top 10 postive and negative ones
+df_top <- df_weights2 %>% group_by(genus) %>% 
+  summarize(mean_weight = mean(value)) %>%
+  ungroup() %>% 
+  # bd is linked to higher latent values
+  mutate(type = ifelse(mean_weight > 0, "bd", "fd")) %>% 
+  group_by(type) %>%
+  slice_max(abs(mean_weight), n= 10) %>% ungroup() %>% arrange(mean_weight) %>%
+  mutate(genus = factor(genus, levels = .$genus))
+
+# plot
+gg_w2 <-  df_top %>% 
+  ggplot(aes(x= genus, y = mean_weight, fill = type)) + geom_bar(stat="identity") +
+  coord_flip() + theme_bw()  + scale_fill_manual(values = cols4diet) +
+  theme(legend.position = "top") + xlab("") + guides(fill = guide_legend(title="")) +
+  geom_point(data = filter(df_weights2, genus %in% df_top$genus),
+             aes(x = genus, y = value), inherit.aes = FALSE, alpha = 0.3) +
+  ylab("Weight (Factor 2)")
+```
+
+
+# Figure
+For completeness, we here assemble the whole figure on this application.
+```{r Figure3, fig.height=7, fig.width=14}
+cowplot::plot_grid(cowplot::plot_grid(gg_fac, gg_scatter,
+                                      labels = c("", "C"), rel_widths = c(1,1.5),
+                                      align = "h", axis = "tb"),
+                   cowplot::plot_grid(gghm, gg_w1, gg_w2,
+                                      rel_widths = c(2,1,1), nrow = 1,
+                                      labels = c("D", "E"), scale = 0.99), 
+                   ncol =1, labels = c("", "C", "D"), align = "v",
+                   axis = "lr", rel_heights = c(1.1,1))
+```
+
+```{r}
+sessionInfo()
+```

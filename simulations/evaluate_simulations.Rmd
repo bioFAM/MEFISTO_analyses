@@ -1,0 +1,261 @@
+---
+title: "Evaluate simulation results"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    toc: true
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(cowplot)
+library(magrittr)
+options(stringsAsFactors = FALSE)
+
+# define colors for Methods
+cols2methods <- c(rep(c("steelblue3", "cyan3"),2),
+                  "gray", "darkolivegreen")
+names(cols2methods) <- c("MEFISTO", "MEFISTO+align",
+                         "no_alignment", "alignment",
+                         "MOFA2", "MEFISTO_sparse") 
+
+# set output directory for  figures
+today <- Sys.Date()
+figdir = paste0("figures_simulation-", today, "/grid/")
+if(!dir.exists(figdir)) {
+  dir.create(figdir)
+}
+knitr::opts_chunk$set(dev = c("png", "pdf"), fig.path = figdir,
+                      warning = FALSE, message = FALSE)
+
+# source helper functions
+source("utils_simulation.R")
+```
+
+# Load simulation results
+Load results from `grid.py`.
+```{r}
+res <- read.csv("out/simulation_results.csv",
+                sep = ',')[,-1]
+
+# subset evaluation to available experiments
+show_align <- "align" %in% unique(res$note)
+show_sparse <- "sparse" %in% unique(res$note)
+show_base <- "vary_N" %in% unique(res$note)
+
+# some renaming etc
+res %<>% rename(noise = noise_level)
+res %<>% mutate(time = as.numeric(time))
+res %<>% mutate(factor_r2 = as.numeric(ifelse(is.na(factor_r2), 0, factor_r2))) # if incorrect number of factors, set R2 to zero
+res %<>% mutate(missing = as.numeric(missing) * 100) # turn to percentage
+
+# extract base parameters of the grid
+base_settings <- res %>% filter(note == "vary_N") %>%
+  select(G, missing, noise) %>% unique()
+base_settings <- c(base_settings, res %>%
+                     filter(note == "vary_G") %>%
+                     select(N) %>% unique())
+df_base_settings <- data.frame(base_value = unlist(base_settings),
+                               param = names(base_settings))
+df_base_settings <- make_nice_names(df_base_settings)
+```
+
+
+# Base grid
+Gather experiments and rename to nicer names.
+```{r, warning=TRUE, message=TRUE, fig.width=8,fig.height=4}
+# gather parameters that were varied
+res_base <- res %>% gather(key = "param", value = "value",
+                               c("N", "G", "noise", "missing"))
+res_base %<>% filter(paste0("vary_",param) == note)
+
+# nice names for parameters
+res_base <- make_nice_names(res_base)
+```
+
+## MSE and factor recovery 
+```{r main,fig.width=10, fig.height=2.2, eval = show_base}
+# Plot factor recovery
+pC <- res_base %>% filter(param != "Noise variance") %>% 
+  ggplot(aes(x= value, y= factor_r2, col = method )) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  geom_vline(data = filter(df_base_settings, param != "Noise variance"),
+             aes(xintercept = base_value), lty = "dashed", col = "black", alpha =0.2) +
+  facet_wrap(~param, scales = "free_x", nrow = 1 ) +
+  stat_summary(fun.data = "mean_se", size = 0.1)  +
+  ylab(expression("Factor recovery ("~R^{2}~")")) +
+  theme_bw() + scale_color_manual(values = cols2methods)+
+  xlab("") + guides(col = FALSE) +
+  scale_x_continuous(breaks = scales::pretty_breaks(4), limits = c(NA, NA)) 
+
+
+# Plot imputation MSE
+pD <- res_base %>% filter(param != "Noise variance", !(param == "% missing samples" & value == 0)) %>% 
+  ggplot(aes(x= value, y= mse, col = method )) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  geom_vline(data = filter(df_base_settings, param != "Noise variance"),
+             aes(xintercept = base_value), lty = "dashed", col = "black", alpha =0.2) +
+  facet_wrap(~param, scales = "free_x") +
+  stat_summary(fun.data = "mean_se", size = 0.1)  +
+  ylab("Imputation MSE") +
+  theme_bw() + scale_color_manual(values = cols2methods)+
+  scale_x_continuous(breaks = scales::pretty_breaks(4), limits = c(NA, NA)) +
+  xlab("") + guides(col = FALSE)
+
+cowplot::plot_grid(pC, pD, scale = 1, rel_widths = c(1,0.95))
+```
+
+
+## Smoothness & sharedness
+```{r}
+gg_smooth <-  plot_smoothness(res_base, methods = "MEFISTO") 
+
+gg_shared <- plot_sharedness(res_base, methods = "MEFISTO") 
+```
+
+```{r smooth_shared, eval = TRUE, fig.width=5,fig.height=6, eval = show_sparse}
+cowplot::plot_grid(gg_smooth, gg_shared, labels = c("A", "B"), ncol = 1)
+```
+
+
+# Evaluation of using sparse Gaussian processes
+```{r}
+res_sparse <- res %>%
+  filter(note == "sparse", method %in% c("MEFISTO", "MEFISTO_sparse")) %>% 
+  gather(key = "param", value = "value", "N") 
+```
+
+## Factor recovery
+```{r, eval = TRUE, fig.width=8,fig.height=4, eval = show_sparse}
+# Plot factor recovery
+min_r2 <- min(res_sparse$factor_r2)
+miny <- min(min_r2, 0.5)
+ggr2 <- ggplot(res_sparse, aes(x= value, y= factor_r2, col = method )) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1)  +
+  ylab(expression("Factor recovery ("~R^{2}~")")) +
+  xlab("Number of timepoints") + theme_bw() + ylim(c(miny,1))+
+  scale_color_manual(values = cols2methods)
+
+# Plot imputation MSE
+ggmse <- ggplot(res_sparse, aes(x= value, y= mse, col = method )) +
+  stat_summary(fun.data = "mean_se",geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1) +
+  ylab("MSE of imputation") +
+  xlab("Number of timepoints") + theme_bw() +
+  scale_color_manual(values = cols2methods)
+```
+
+## Time and Memory
+```{r, fig.width=8,fig.height=4, eval = show_sparse}
+# Plot time and memory
+gg_time <- res_sparse %>%
+  mutate(time = as.numeric(time) / 60) %>%
+  ggplot(aes(x= value, y= time, col = method)) +
+  stat_summary(fun.data = "mean_se",geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1) +
+  theme_bw() +
+  xlab("Number of timepoints") + ylab("time [min]") +
+  scale_color_manual(values = cols2methods)
+
+gg_mem <- res_sparse %>%
+  mutate(mem_usage = as.numeric(mem_usage) / 2^10 / 2^10) %>%
+  ggplot(aes(x= value, y= mem_usage, col = method)) +
+  stat_summary(fun.data = "mean_se",geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1) +
+  theme_bw() +
+  xlab("Number of timepoints") + ylab("memory usage [MB]") +
+  scale_color_manual(values = cols2methods) 
+```
+
+## Smoothness
+```{r, warning=TRUE, message=TRUE, eval = show_sparse}
+gg_smoothness <- plot_smoothness(res_sparse, methods = c("MEFISTO", "MEFISTO_sparse"))
+```
+
+## Joint plot for sparse GP
+```{r sparse, fig.width=10,fig.height=2.5, eval = show_sparse}
+gg_sparse <- cowplot::plot_grid(ggr2 + guides(col = F),
+                   ggmse + guides(col = F),
+                   gg_time + guides(col = F),
+                   gg_mem + guides(col = F),
+                   cowplot::get_legend(gg_time),
+                   labels = c("A","B", "C", "D",""),
+                   ncol = 5, scale = 0.98
+                   )
+
+gg_sparse
+```
+
+
+# Alignment evaluation
+```{r}
+res_align <- filter(res, note == "align") %>%
+    gather(key = "param", value = "value", "N") 
+```
+
+## Factor revocery and MSE of imputation
+```{r, eval = show_align, fig.width=8, fig.height=4}
+# Plot factor recovery
+ggr2 <- ggplot(res_align, aes(x= value, y= factor_r2,
+                              col = method, lty = method == "MEFISTO+align" )) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1) +
+  ylab(expression("Factor recovery ("~R^{2}~")")) + theme_bw() +
+  scale_color_manual(values = cols2methods) +
+  guides(lty = FALSE) + xlab("Number of timepoints")+
+  scale_x_continuous(breaks = scales::pretty_breaks(4), limits = c(NA, NA))
+
+# Plot imputation MSE
+ggmse <- ggplot(res_align, aes(x= value, y= mse,
+                               col = method, lty = method == "MEFISTO+align")) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1)  +
+  ylab("Mean squared error of imputation") +
+  theme_bw() + scale_color_manual(values = cols2methods) +
+  guides(lty = FALSE)  + xlab("Number of timepoints")+
+  scale_x_continuous(breaks = scales::pretty_breaks(4), limits = c(NA, NA))
+
+```
+
+## Smoothness & sharedness
+```{r, eval = show_align}
+gg_smoothness <- plot_smoothness(res_align, methods = c("MEFISTO", "MEFISTO+align")) 
+gg_sharedness <- plot_sharedness(res_align, methods = c("MEFISTO", "MEFISTO+align"))
+```
+
+## Warping function MSE
+```{r, fig.width=4, fig.height=3, eval=show_align}
+gg_warpmse <- res_align %>%
+  filter(method %in% c("MEFISTO", "MEFISTO+align")) %>%
+  mutate(method = ifelse(method == "MEFISTO", "no_alignment", "alignment")) %>%
+  ggplot(aes(x= value, y= warp_mse,
+             col = method, lty = method == "MEFISTO+align" )) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se", size = 0.1) +
+  ylab("MSE of warping") + theme_bw() +
+  scale_color_manual(values = cols2methods) +
+  guides(lty = FALSE)  + xlab("Number of timepoints")+
+  scale_x_continuous(breaks = scales::pretty_breaks(4), limits = c(NA, NA))
+```
+
+## Joint plot
+```{r align, fig.width=10, fig.height=10, eval=show_align}
+plot_grid(ggr2 + guides(col = F),
+                   ggmse + guides(col = F),
+                  get_legend(ggmse),
+                    gg_smoothness+ guides(col = F, lty = FALSE),
+                   gg_sharedness+ guides(col = F, lty = FALSE),
+                  plot_grid(get_legend(gg_smoothness + guides(lty = FALSE)), get_legend(gg_sharedness + theme(legend.title = element_blank())), ncol =1),
+                  gg_warpmse + guides(col = F),
+                  get_legend(gg_warpmse),
+                  labels = c("A","B", "", "C", "D", "", "E"),
+                  nrow = 3)
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+

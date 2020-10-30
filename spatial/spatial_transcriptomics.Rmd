@@ -1,0 +1,246 @@
+---
+title: "MEFISTO application to spatial transcriptomics data"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+
+```{r, warning=FALSE, message=FALSE}
+library(MOFA2)
+library(tidyverse)
+library(cowplot)
+library(magrittr)
+
+# number of inducing points
+n_inducing <- 1000
+
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_spatial-", today, "/brain/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+```
+
+# Load ST data set
+We use the example data provided in the [Seurat vignette](https://satijalab.org/seurat/v3.2/spatial_vignette.html), which contains spatial transcriptomics data on a slide of a mouse brain tissue generated using 10x visium.
+
+```{r, eval = !file.exists("data/brain.RData")}
+library(Seurat)
+SeuratData::InstallData("stxBrain")
+brain <- SeuratData::LoadData("stxBrain", type = "anterior1")
+brain <- Seurat::NormalizeData(brain, assay = "Spatial", verbose = FALSE)
+brain <- Seurat::FindVariableFeatures(brain, assay = "Spatial")
+if(!dir.exists('data')) dir.create('data')
+save(brain, file = "data/brain.RData")
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(Seurat)
+load("data/brain.RData")
+```
+
+
+# Preprocess data for MEFISTO
+Next, we prepare the data for input to MEFISTO (using the 2000 top variable features). For this we need the expression data as well as the spatial coordinates of each sample (spot).
+```{r}
+expression_data <- as.matrix(brain@assays$Spatial@data[VariableFeatures(brain),])
+locs <- GetTissueCoordinates(brain)
+stopifnot(all(rownames(locs) == colnames(expression_data)))
+locs <- tibble::rownames_to_column(locs, "sample") %>%
+  gather(key = "covariate", value = "value", starts_with("image"))
+```
+
+# Create a MOFA object specifying spatial coordinates as covariates
+To create a space-aware MOFA model (= MEFISTO) we provide MOFA the expression data as well as the spatial coordinates in `set_covariates`. Once created, we can export the training data contained in the model to `.csv` used for training in python using `run_brainST.py`.
+```{r}
+# create MOFA objects and specify covariate
+sm <- create_mofa(data = list(RNA = expression_data))
+sm <- set_covariates(sm, locs)
+
+# export as csv for training in python
+if(!file.exists('data/brain_view_1.csv') || !file.exists('data/brain_view_1.csv')){
+  dat <- get_data(sm)
+  for (m in seq_along(dat))
+    write.csv(dat[[m]], file = paste0("data/brain_view_",m, ".csv"))
+  write.csv(get_covariates(sm), file =  "data/brain_sample_cov.csv")
+}
+```
+
+# Prepare training
+Before training, we can specify various options for the model, the training and the data pre-processing. If no options are specified, the model will use the default options. See also `get_default_data_options`, `get_default_model_options`, `get_default_training_options` and `get_default_smooth_options` to have a look at the defaults and change them where required. 
+
+Here, we in particular, specify that we want to use spare Gaussian process with a given number of inducing points which can speed up training.
+```{r}
+model_opts <- get_default_model_options(sm)
+model_opts$num_factors <- 4
+
+smooth_opts <- get_default_smooth_options(sm)
+smooth_opts$sparseGP <- TRUE
+smooth_opts$n_inducing <- n_inducing 
+
+train_opts <- get_default_training_options(sm)
+train_opts$seed <- 2021
+
+sm <- prepare_mofa(sm, training_options = train_opts,
+                   model_options = model_opts,
+                   smooth_options = smooth_opts)
+```
+
+
+```{r}
+outfile = paste0("out/brain_N", n_inducing,"_K",model_opts$num_factor,".hdf5")
+```
+
+Next, we train the model. As running the model can take some time, we do not train the model here but from python in `run_brainST.py` and then load the pre-trained model in the next chunk.
+```{r, eval = FALSE}
+# sm <- run_mofa(sm, outfile = outfile)
+```
+
+# Load a trained model
+```{r}
+knitr::opts_chunk$set(eval = file.exists(outfile), echo = file.exists(outfile))
+```
+
+```{r}
+sm <- load_model(outfile)
+
+# add feature names back on trained model
+features_names(sm) <- list(rownames(expression_data))
+```
+
+
+# Downstream analyses
+## Variance decomposition
+First, we can take a look whether our factor are uncorrelated.
+```{r}
+plot_factor_cor(sm)
+```
+
+## Spatial factors
+Next, we will have a look at the spatial patterns that are captured by each factor.
+```{r, fig.width=6, fig.height=2}
+locs <- get_covariates(sm, as.data.frame = TRUE) %>%
+  spread(key="covariate", value = "value")
+Z <- get_factors(sm, as.data.frame = TRUE)
+df <- left_join(locs, Z, by = "sample")
+gg_factor <- ggplot(df, aes(x = covariate0, y = -covariate1, 
+        col = value)) + geom_point() + scale_color_gradient2() + 
+        geom_point(col = "grey", alpha = 0.05) + facet_grid(~factor) + 
+        theme_bw() +
+        theme(axis.text = element_blank(),
+              axis.title = element_blank(),
+              axis.ticks = element_blank(),
+              legend.position = "top",
+              legend.margin = margin(0,0, -0.3,0, unit = "cm"))
+```
+
+## Smoothness of factors
+All of this factors seem to capture spatial patterns of variation that vary smoothly along space. We can take a look at the smoothness score inferred by the model.
+```{r}
+gg_bar <- plot_smoothness(sm)
+
+# Let's add this to the factor plot
+gg_factor <- plot_grid(gg_factor,
+                       gg_bar + theme(strip.text = element_blank(),
+                                      plot.margin = unit(c(0,0,0,0), "cm")),
+                       rel_heights = c(1,0.1), nrow =2,
+                       align = "hv", axis = "lr")
+gg_factor
+```
+
+## Weights
+To inspect which genes underly these spatial patterns, we can take a look at the top weights per factor. For example, Factor 4 highlights Ttr, a marker of the choroid plexus.
+```{r, fig.width=6, fig.height=2}
+gg_w <- cowplot::plot_grid(plotlist = lapply(1:4, function(i) {
+  plot_top_weights(sm, factors = i) +
+    theme(strip.text = element_blank())
+  }),
+  nrow = 1) 
+gg_w
+```
+
+To explore the expression patterns of these genes that are highlighted on the weights by MEFISTO, we can use Seurat's `SpatialFeaturePlot`.
+```{r}
+W <- get_weights(sm)[[1]]
+top_weights <- rownames(W)[apply(abs(W), 2, which.max )]
+list_seurat <- SpatialFeaturePlot(brain, features = top_weights,
+                                combine = F)
+gg_seurat <- plot_grid(plotlist = list_seurat, nrow = 1)
+gg_seurat
+```
+
+## Main figure
+For completeness we assemble the figure of the manuscript here, showing the spatial patterns inferred by the factors, their associated smoothness scores, weights and the gene expression pattern of the top weighted gene per factor.
+```{r Figure4, fig.width=9, fig.height=7.5}
+cowplot::plot_grid(gg_factor,
+                   gg_w + theme(text = element_text(size =10),
+                                strip.text = element_blank()),
+                   gg_seurat,
+                   labels = LETTERS[1:3], ncol = 1, axis = "hv", scale = 0.95,
+                   align = "lr", rel_heights = c(1.15, 0.9, 0.85))
+```
+
+# Analysis on the number of inducing points
+Above, we have used a subset of 1,000 points as inducing points for MEFISTO. Here, we compare the results to models that use all spots or less spots to model the spatial covariance patterns.
+```{r comparison, fig.width=5, fig.height=4}
+# load the pre-trained models (trained in run_brainST.py)
+list_models <- lapply(c(500, 1000, "full"), function(n_inducing) {
+  load_model(paste0("out/brain_N", n_inducing,"_K4.hdf5"))
+})
+names(list_models) <- c("N_500", "N_1000", "N_all")
+
+# create annotation data frame for heatmap
+dfanno <- data.frame(N = factor(rep(c("500", "1000", "all"), 4),
+                                levels = c("500", "1000", "all")),
+                     Factor = paste0('Factor',rep(1:4, each = 3)))
+rownames(dfanno) <- paste0("N_", dfanno$N, "_", dfanno$Factor)
+ann_colors = list(
+    N = RColorBrewer::brewer.pal(3, "Blues"),
+    Factor = RColorBrewer::brewer.pal(4, "Dark2")
+)
+names(ann_colors[[1]]) <- levels(dfanno$N)
+names(ann_colors[[2]]) <- unique(dfanno$Factor)
+
+# compare factors
+gg_comp <- compare_factors(list_models, show_rownames = FALSE,
+                           show_colnames = FALSE,
+                           treeheight_row = 10, treeheight_col = 10,
+                           annotation_row = dfanno, fontsize = 7,
+                           silent = TRUE, annotation_colors = ann_colors)
+
+# compare elbo
+df_elbo <- compare_elbo(list_models, return_data = TRUE) %>%
+  mutate(model = factor(gsub("N_","",model),
+                        levels = c("500", "1000", "all")))
+gg_elb <- ggplot(df_elbo, aes(x = model, y = ELBO)) +
+  geom_bar(stat = "identity", color = "black", fill = "cornflowerblue") +
+  labs(x = "N", y = "ELBO") + theme_classic() +
+  theme(plot.margin = unit(c(0.5,1,0,0), "cm"))
+
+# compare time and memory
+df <- read.csv("out/brain_stats.csv")
+df %<>% mutate(time = time / 60)
+df %<>% mutate(memory = mem_usage / 2^10 / 2^10)
+df %<>% mutate(n_inducing = factor(n_inducing, levels = c(500, 1000, "full")))
+gg_t <- ggplot(df, aes(x=n_inducing,  y= time)) + geom_point() +
+  ylab("time [min]") + theme_bw()
+gg_mem <- ggplot(df, aes(x=n_inducing,  y= memory)) + geom_point() +
+  ylab("memory [MB]")+ theme_bw()
+
+# make figure
+cowplot::plot_grid(gg_comp$gtable, gg_t,
+                   gg_elb, gg_mem, 
+                   scale = 0.9, ncol = 2, rel_widths = c(1.5,1, 1),
+                 labels = c("A", "C", "B", "D"))
+```
+
+We can see that 4 factors are stably recovered with different number of inducing points, the memory and time is greatly reduced by the usage of inducing points.
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+

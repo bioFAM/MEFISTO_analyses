@@ -1,0 +1,124 @@
+---
+title: "Illustration of warping for one example data set"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(MOFA2)
+library(magrittr)
+```
+
+The following model was trained using `make_align_example.sh`.
+```{r, warning=FALSE}
+model <- load_model("out/grid_model.hdf5")
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_simulation-", today, "/align_example/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir,
+                      warning = FALSE,
+                      message = FALSE)
+```
+
+# Plot actors over time (before/after alignment)
+```{r}
+dftimes <- samples_metadata(model)
+dfZ <- get_factors(model, as.data.frame = TRUE)
+df <- left_join(dfZ, dftimes, by = c("sample", "group"))
+df %<>% rename(after_alignment = covariate0_warped,
+               before_alignment = covariate0)
+df %<>% gather(key = "warping", value = "time",
+               c("before_alignment", "after_alignment"))
+
+# before warping
+gg1 <- plot_factors_vs_cov(model, color_by = "group",
+                           covariate = "covariate0", warped = FALSE) +
+  xlab("unmatched time")+ theme(axis.ticks.x = element_blank(),axis.text.x = element_blank())
+
+# after warping
+gg2 <- plot_factors_vs_cov(model, color_by = "group",
+                           covariate = "covariate0", warped = TRUE) +
+  xlab("learnt common time") +
+  theme(axis.ticks.x = element_blank(),axis.text.x = element_blank())
+
+# joint plot
+gg_fac <- cowplot::plot_grid(gg1 + guides(col = FALSE) , gg2 + guides(col = FALSE), ncol = 1)
+```
+
+# Learnt warping functions
+```{r}
+# warping functions used in simulation
+df_sim <- lapply(0:2, function(g) {
+df <- data.frame(common_time = rep(seq(0,1, length.out = 20),3),
+                 group = paste0("group",g))
+if(g == 0) {
+  df$time = df$common_time
+} else if(g == 1) {
+  df$time = exp(df$common_time)
+} else {
+  df$time = 0.4 * (df$common_time) + 0.3
+}
+return(df)
+}
+) %>% bind_rows()
+df_sim$method <- "ground_truth"
+
+# learnt warping
+df_learnt <- samples_metadata(model) %>%
+  select(group, covariate0, covariate0_warped) %>%
+  rename(time = covariate0, common_time = covariate0_warped ) 
+df_learnt$method <- "learnt"
+
+# combine
+df <- rbind(df_learnt, df_sim)
+
+# make plot
+gg_warp <- df %>%
+    ggplot(aes(x= common_time, y= time, col = group, lty = method)) +
+  geom_line() + theme_bw()
+```
+
+# Joint plot
+```{r align_example, fig.height=4}
+cowplot::plot_grid(gg_fac + guides(col = FALSE), gg_warp,
+                   nrow =1, labels = LETTERS[1:2])
+```
+
+
+# DTW illustration
+```{r dtw_illustration, fig.width=3, fig.height=2}
+dftimes <- samples_metadata(model)
+dfZ <- get_factors(model, as.data.frame = TRUE)
+df <- left_join(dfZ, dftimes, by = c("sample", "group"))
+df %<>% rename(after_alignment = covariate0_warped, before_alignment = covariate0)
+
+matched_df <- lapply(seq_len(nrow(df)), function(i) {
+  x <- df[i,]
+  corresponding_sample = which(df$before_alignment == x$after_alignment & df$group == "group0" & df$factor == x$factor)
+  x$corresponding_val = df$value[corresponding_sample]
+  x
+}) %>% bind_rows()
+
+col4groups <- scales::hue_pal()(3)
+names(col4groups) <- paste0("group", 0:2)
+
+matched_df %>% filter(factor == "Factor2", group %in% c("group1", "group0")) %>%
+ggplot(aes(x = before_alignment, y = value, col = group)) + geom_point() + geom_line()+
+  geom_segment(aes(xend=after_alignment, yend = corresponding_val), lty = "dashed", alpha = 0.3) + theme_bw() + xlab("unmatched time")+
+  scale_color_manual(values = col4groups)+ guides(col = FALSE) + ylab("latent value")
+
+matched_df %>% filter(factor == "Factor2", group %in% c("group2", "group0")) %>%
+ggplot(aes(x = before_alignment, y = value, col = group)) + geom_point() + geom_line()+
+  geom_segment(aes(xend=after_alignment, yend = corresponding_val), lty = "dashed", alpha = 0.3) + theme_bw() + xlab("unmatched time") +
+  scale_color_manual(values =col4groups) + guides(col = FALSE)+ ylab("latent value")
+```
+
+```{r}
+sessionInfo()
+```
+

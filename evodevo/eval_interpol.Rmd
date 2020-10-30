@@ -1,0 +1,45 @@
+---
+title: "Evaluate interpolation results"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(magrittr)
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_evodevo-", today, "/interpolation/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+```
+
+```{r}
+cols2methods <- c("steelblue3", "gray")
+names(cols2methods) <- c("MEFISTO",
+                         "MOFA2")
+```
+
+
+# Load results 
+```{r}
+df <- read.csv("out/interpol_results_evodevo.csv")
+df %<>% filter(!is.na(Nviews)) # filter out empty rows
+df %<>% mutate(method = ifelse(GP_factors, "MEFISTO", "MOFA2"))
+```
+
+# Plot
+```{r interpolation, fig.height=3}
+df <- mutate(df, Nviews = paste("Missing views:", Nviews))
+ggplot(df, aes(x=Tmissing, y = mse, col = method)) + facet_wrap(~ Nviews) +
+  stat_summary(fun.data = "mean_se", geom = "line") + stat_summary(fun.data = "mean_se") + 
+  xlab("Missing time points") + ylab("Mean squared error") + theme_bw() + scale_color_manual(values = cols2methods)
+```
+
+```{r}
+sessionInfo()
+```
+
