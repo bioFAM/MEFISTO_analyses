@@ -43,7 +43,7 @@ ent.set_train_options(seed = 2020)
 ent.set_covariates([scov])
 n_inducing = sys.argv[1]
 if n_inducing != "full":
-	ent.set_smooth_options(sparseGP = True, n_inducing = int(n_inducing))
+	ent.set_smooth_options(sparseGP = True, frac_inducing = int(n_inducing) / dd.shape[0])
 else:
 	ent.set_smooth_options(sparseGP = False)
 

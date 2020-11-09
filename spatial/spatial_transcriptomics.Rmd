@@ -79,7 +79,7 @@ model_opts$num_factors <- 4
 
 smooth_opts <- get_default_smooth_options(sm)
 smooth_opts$sparseGP <- TRUE
-smooth_opts$n_inducing <- n_inducing 
+smooth_opts$frac_inducing <- n_inducing / get_dimensions(sm)$N
 
 train_opts <- get_default_training_options(sm)
 train_opts$seed <- 2021
