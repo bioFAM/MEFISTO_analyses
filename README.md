@@ -9,5 +9,5 @@ This repository contains application of MEFISTO to simulated and multi-modal omi
 
 MEFISTO is implemented as part of the MOFA framework.
 
-Please visit [our webpage](https://biofam.github.io/MOFA2/) for more information on the framework and how to use MEFISTO with it.
+Please visit [our webpage](https://biofam.github.io/MOFA2) for more information on the framework and how to use [MEFISTO](https://biofam.github.io/MOFA2/MEFISTO) with it.
 There you will find additional tutorials, vignettes and FAQs.
