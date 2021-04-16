@@ -1,0 +1,86 @@
+---
+title: "Export count data for the use in CTF analogous to MEFISTO"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(MOFA2)
+library(reshape2)
+source("utils.R")
+```
+
+```{r}
+datadir <- "data/processed_data/"
+```
+
+# Load data
+```{r}
+samples_meta <- read.csv(file.path(datadir, "samples_metadata.csv"))
+features_meta <- read.csv(file.path(datadir, "features_metadata.csv"))
+# CTF filters before applying RCLR
+data <- read.csv(file.path(datadir, "counts_matrix_filtered.csv"),row.names = 1)
+
+colnames(data) <- gsub("X10249", "10249", colnames(data))
+data <- as.matrix(data)
+df_data <- melt(data, varnames = c("feature_id", "sample_id")) %>%
+  left_join(select(samples_meta, sample_id = SampleID, child_id, month),
+            by = "sample_id")
+
+# average per month (otherwise done internally in CTF upon tensor construction, doing it here simplifies common masking)
+# see https://github.com/biocore/gemelli/blob/c419b0392e87daefe800c645b837abc4172a9a26/gemelli/preprocessing.py
+df_data <- df_data %>%
+  group_by(month, child_id, feature_id) %>%
+  summarise(value = mean(value)) %>% ungroup()
+
+# make child-level df on meta data
+meta_child <- select(samples_meta, child_id, delivery, diet, sex)
+meta_child <- meta_child[!duplicated(meta_child),]
+
+# expand
+df_data <- complete(df_data,expand(df_data, child_id, month, feature_id))
+
+# fill in child-level information
+df_data$view <- "microbiome"
+df_data <- mutate(df_data, sample_id = paste(child_id, month, sep ="_"))
+df_data <- df_data %>% left_join(meta_child, by = "child_id")
+
+# zeros are turned to NAs internally in CTF
+
+# features are centered internally in CTF
+
+# rename as required by MOFA/MEFISTO
+df_data <- rename(df_data, feature = feature_id,
+                  sample = sample_id, group = child_id)
+head(df_data)
+```
+
+
+# Create MOFA object and export data
+```{r}
+# create the MOFA object and add times as covariate
+MOFAobject_untrained <- create_mofa(data = df_data)
+MOFAobject_untrained <- set_covariates(MOFAobject_untrained, covariates = "month")
+MOFAobject_untrained
+```
+
+```{r}
+traindata_dir <- "data/input_data_counts/"
+```
+
+```{r, eval = !dir.exists(traindata_dir)}
+# optional: export data for training from python
+dir.create(traindata_dir)
+write.csv(df_data, file = file.path(traindata_dir, "microbiome_data.csv"))
+export_data(model = MOFAobject_untrained, dir = traindata_dir)
+write.csv(groups_names(MOFAobject_untrained),
+          file = file.path(traindata_dir, "groups.csv"))
+write.csv(views_names(MOFAobject_untrained),
+          file = file.path(traindata_dir, "views.csv"))
+```
+
+```{r}
+sessionInfo()
+```

@@ -25,7 +25,7 @@ knitr::opts_chunk$set(dev = c("png", "pdf"),
                       message = FALSE)
 ```
 
-# Plot actors over time (before/after alignment)
+# Plot factors over time (before/after alignment)
 ```{r}
 dftimes <- samples_metadata(model)
 dfZ <- get_factors(model, as.data.frame = TRUE)

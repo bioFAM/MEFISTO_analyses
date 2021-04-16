@@ -2,7 +2,8 @@
 conda activate mefisto
 
 
-experiments=(noise G N missing align sparse) 
+#experiments=(noise G N missing align sparse) 
+experiments=(align) 
 for type in ${experiments[@]}
 do
    for seed in 41741 13421 14390 93243 434432 12334 58334 1244 18484 99732

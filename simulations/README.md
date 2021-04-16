@@ -12,3 +12,6 @@ In particular,
 * `example_warping.Rmd` visualizes the results from this illustrative example model
 * `toy_data.py`, `submit_toy.sh` and `toy_data.Rmd` are used to simulate and evaluate an illustrative example to compare time-aware MEFISTO and time-agnostic MOFA on a single data set (as in Figure 1)
 * `utils_simulation.R` contains some helper functions
+* `alignment/` contains the files for additional tests on the alignment
+* `univGP/` contains the files for additional comparisons of univariate GP regression models in terms of interpolation accuracy
+

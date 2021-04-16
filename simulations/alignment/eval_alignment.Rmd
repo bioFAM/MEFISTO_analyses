@@ -1,0 +1,60 @@
+---
+title: "Alignment testing"
+author: "Britta Velten"
+date: "3/17/2021"
+output: BiocStyle::html_document
+---
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+basdir <- "out"
+
+# set output directory for figures
+today <- Sys.Date()
+figdir = paste0("figures_alignment-", today, "/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+```
+
+
+# Impact of non-temporal factors
+```{r nonsmooth}
+res <- read.csv(file.path(basdir,"nonsmooth.csv"))
+
+baseline <- filter(res, n_factors == n_nonsmoothfactors) %>% .$warp_mse %>% mean()
+gg_nonsmooth <- ggplot(filter(res, n_factors != n_nonsmoothfactors),
+       aes(x = n_nonsmoothfactors/n_factors , y = warp_mse)) +
+  stat_summary() + theme_bw() + xlab("Fraction of non-temporal factors") +
+  ylab("Alignment MSE") + geom_hline(yintercept = baseline, lty = "dashed", alpha = 0.4)
+```
+
+# Impact of large views without smooth shared variation
+```{r imbalance}
+res <- read.csv(file.path(basdir,"imbalance.csv"))
+
+gg_imbalance <- ggplot(res, aes(x = D1 , y = warp_mse)) +
+  stat_summary() + theme_bw() + xlab("Number of features in non-temporal view") +
+  ylab("Alignment MSE")+ geom_vline(xintercept = unique(res$D0), lty = "dashed") +
+  geom_hline(yintercept = baseline, lty = "dashed", alpha = 0.4)
+gg_imbalance
+```
+
+```{r imbalance_weighted}
+res_weighted <- read.csv(file.path(basdir,"imbalance_weighted.csv"))
+res <- rbind(res_weighted, res)
+gg_imbalance_weighted <- ggplot(res, aes(x = D1 , y = warp_mse, col = weight_views)) +
+  stat_summary() + theme_bw() + xlab("Number of features in non-temporal view") +
+  ylab("Alignment MSE")+ geom_vline(xintercept = unique(res$D0), lty = "dashed") +
+  geom_hline(yintercept = baseline, lty = "dashed", alpha = 0.4) +
+  theme(legend.position = "top") + scale_color_manual(values = c("black", "forestgreen"))
+gg_imbalance_weighted
+```
+
+
+```{r alignment, fig.width=7, fig.height =3}
+cowplot::plot_grid(gg_nonsmooth, gg_imbalance_weighted, labels = c("A","B"),
+                   align = "h", axis = "t")
+```
+
+

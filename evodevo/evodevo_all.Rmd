@@ -13,6 +13,10 @@ library(cowplot)
 library("openxlsx")
 library(reshape2)
 library(scales)
+library(RColorBrewer)
+library(pheatmap)
+library(UpSetR)
+library(ggplotify)
 
 # source plotting and data handling utils functions
 source("utils_evodevo.R")
@@ -103,9 +107,9 @@ data_opts <- get_default_data_options(MOFAobject_untrained)
 model_opts <- get_default_model_options(MOFAobject_untrained)
 model_opts$num_factors <- 5
 
-smooth_opts <- get_default_smooth_options(MOFAobject_untrained)
-smooth_opts$warping <- TRUE
-smooth_opts$warping_ref <- "Mouse"
+mefisto_opts <- get_default_mefisto_options(MOFAobject_untrained)
+mefisto_opts$warping <- TRUE
+mefisto_opts$warping_ref <- "Mouse"
 
 train_opts <- get_default_training_options(MOFAobject_untrained)
 train_opts$seed <- 2020
@@ -117,7 +121,7 @@ MOFAobject_untrained <- prepare_mofa(
   data_options = data_opts,
   model_options = model_opts,
   training_options = train_opts,
-  smooth_options = smooth_opts
+  mefisto_options = mefisto_opts
 ) 
 ```
 
@@ -504,6 +508,33 @@ features_names(MOFAobject_symbol) <- lapply(
 ```
 
 
+```{r}
+utils::data("MSigDB_v6.0_C5_human", package = "MOFAdata") 
+# conduct enrichment analysis
+
+# remove organ part from feature names in MOFA for match with feature names in reactome GS
+MOFAobject_renamed <- MOFAobject
+features_names(MOFAobject_renamed) <- lapply(features_names(MOFAobject_renamed), function(l) gsub("_.*","", l))
+
+# conduct enrichment analysis
+df_enrich_msigdb <- lapply(views_names(MOFAobject_renamed), function(t) {
+  enrichment.parametric <- run_enrichment(MOFAobject_renamed,
+    view = t, factors = "all",
+    feature.sets = MSigDB_v6.0_C5_human,
+    statistical.test = "parametric",
+    sign = "all"
+  )
+  pvalues_view <- data.frame(enrichment.parametric$pval.adj)
+  pvalues_view %>%
+    rownames_to_column(var = "pathway") %>%
+    mutate(view = t)
+
+}) %>% bind_rows()
+
+df_enrich_msigdb %<>% gather(starts_with("Factor"), value = "padj", key = "factor")
+write.csv(df_enrich_msigdb, file = file.path(figdir, "enrich_mSigDB"))
+```
+
 Let's have a look at the gene expression trajectories of the genes with highest weight per factor. As not all factors are active in all organs, we look at those organs, where the factor explains most variation.
 
 ## Factor 1
@@ -604,7 +635,7 @@ ggplot(aes(x=MRRab_H, y = (value), fill = MRRab_H)) +
   geom_violin() + facet_wrap(~view) +
   geom_boxplot(width=0.1) +
   scale_fill_manual(values = c("grey", "forestgreen")) +
-  theme_bw()+ ylab("factor value") +
+  theme_bw()+ ylab("Weight of Factor 4") +
   xlab("Previously identified trajectory changes between human \n compared to mouse, rat and rabbit ")
 ```
 
@@ -661,7 +692,7 @@ ggplot(aes(x=MRRabH_O, y = (value), fill = MRRabH_O)) +
   geom_violin() + facet_wrap(~view) +
   geom_boxplot(width=0.1) +
   scale_fill_manual(values = c("grey", "forestgreen"))+
-  theme_bw() + ylab("factor value")  +
+  theme_bw() + ylab("Weight of Factor 5")  +
   xlab("Previously identified trajectory changes between opossum \n compared to human, mouse, rat and rabbit ")
 
 ```
@@ -813,6 +844,116 @@ plot_grid(plot_grid(gg_gsea,
                     ncol =2, labels = c("A", "B"),
                     rel_widths = c(1.4, 1)),
           gg_pan, ncol = 1, labels = c("", "C"))
+```
+
+
+## Organ-level comparison of weights on species-specific factors 
+
+### Correlation of the weights across organs
+```{r correlation_heatmap, fig.width = 12, fig.height=3}
+# extract weights into a dataframe
+weights <- MOFA2::get_weights(MOFAobject, views = "all", factors = "all", 
+                              scale = F, as.data.frame = TRUE)
+weights %<>% separate(feature, "_", extra = "drop")
+colnames(weights) <- c("ens_id", "factor", "value", "view")
+weights <- weights[order(abs(weights$value), decreasing = TRUE), ]
+cor_weights <- spread(weights, key = view, value = value)
+
+# set colors for the heatmap
+breaksList = seq(-1, 1, by = 0.2)
+color = colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(length(breaksList))
+
+# calculate correlation and create a heatmap for each factor
+plot_list = list()
+for (f in 4:5){
+  cor_factor <- filter(cor_weights, factor == paste0("Factor", f))
+
+  cor_matrix <- cor(cor_factor[, 3:ncol(cor_factor)], use = "pairwise.complete.obs")
+  plot = pheatmap(cor_matrix, main = paste0("Factor ", f), breaks = breaksList, 
+                  color = color, fontsize = 17, treeheight_row = 10, 
+                  treeheight_col = 10, show_colnames = FALSE,
+                  silent = TRUE, legend = FALSE)
+  plot_list[[f-2]] = plot$gtable
+}
+
+# add legend
+plot = pheatmap(cor_matrix, breaks = breaksList, color = color, fontsize = 17, 
+                treeheight_row = 10, treeheight_col = 10, 
+                silent = TRUE, legend = TRUE)
+plot_list[[4]] = plot$gtable$grobs[[6]]
+
+# plot
+cor_f4_f5 <- plot_grid(plotlist = plot_list, nrow = 1,
+                          rel_widths = c(0.3, 1,1, 0.2),
+                          scale = 0.95)
+cor_f4_f5
+```
+
+
+### Intersection of the top200 weights for each organ
+```{r top200_organs,  fig.width = 12, fig.height=5}
+intersections <- lapply(c("Factor4", "Factor5"), function(f){
+  top_features <- weights %>% filter(factor == f) %>% 
+    group_by(view) %>% top_n(200, abs(value)) %>% group_split()
+  names(top_features) <- organs
+  top_features <- lapply(top_features, function(list) list$ens_id)
+  
+  plot <- upset(fromList(top_features), order.by = "freq", nsets = 7,
+         mainbar.y.label = "Tissue Intersections", sets.x.label = "Genes per tissue",
+         text.scale = c(2.5, 2, 1, 1, 2, 1.5), nintersects = 12)
+  return(as.grob(plot))
+})
+
+intersections <- plot_grid(intersections[[1]], intersections[[2]], nrow = 1, rel_widths = c(1,1))
+intersections
+```
+
+
+### GSEA with cell-type markers
+```{r gsea_celltype, echo=T, results='hide', fig.width = 12, fig.height=5}
+#get df with ens_id and gene symbols 
+gene_names <- gene_description[,1:2]
+colnames(gene_names) <- c("ens_id", "official.gene.symbol")
+
+#load PanglaoDB database
+panglaodb <- read.table(file.path(datadir, "panglaodb.tsv"), 
+                        h = T, sep = "\t", quote = '') %>%
+  filter(official.gene.symbol %in% gene_description$symbol) %>%
+  left_join(gene_names, by = "official.gene.symbol") %>%
+  select(ens_id, cell.type) %>% mutate(value = 1) %>%
+  spread(ens_id, value, fill = 0) %>%
+  column_to_rownames(var = "cell.type") %>% data.matrix()
+
+# conduct enrichment analysis
+logp <- c()
+
+for (tissue in organs) {
+  enrichment.parametric <- MOFA2::run_enrichment(MOFAobject_renamed,
+    view = tissue, factors = "all",
+    feature.sets = panglaodb,
+    statistical.test = "parametric",
+    sign = "all")
+  
+  pvalues_view <- data.frame(enrichment.parametric$pval.adj)
+  logp_view <- -log10(pvalues_view + 1e-100) %>%
+    rownames_to_column(var = "pathway") %>%
+    mutate(view = tissue)
+  logp <- rbind(logp, logp_view)
+}
+
+# plot
+f4 = plot_gsea_heatmap(factor = "Factor4", npathways = "all", stats = max)
+f5 = plot_gsea_heatmap(factor = "Factor5", npathways = "all", stats = max)
+f <- c()
+gsea_f4_f5 <- plot_grid(f,f4, f5, nrow = 1, rel_widths = c(0.25, 1, 1))
+gsea_f4_f5
+```
+
+
+### Supplementary Figure 18
+```{r sup_fig_18, fig.width = 12, fig.height = 14}
+plot_grid(cor_f4_f5, intersections, gsea_f4_f5, ncol = 1, 
+          labels = c("A", "B", "C"), label_size = 20)
 ```
 
 

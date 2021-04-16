@@ -1,0 +1,128 @@
+---
+title: "Factor stability"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(MOFA2)
+library(reshape2)
+library(magrittr)
+```
+
+Compare the stability of the factors to downsampling on the microbiome data (pre-processing following Martino et al, Nat Biotech 2021). As this results in missing values and negative values comparison is limited to CTF, MOFA2 and MEFISTO. (PCA, NMF and ZIFA require non-missing values and the latter two positive data and would require a different preprocessing, e.g. variance stabilization of counts with library size correction).
+
+```{r prep}
+cols4diet <- c("#1f78b4", "#b2df8a")
+names(cols4diet) <- c("fd", "bd")
+
+cols4delivery <- c("#e6ab02", "#d95f02")
+names(cols4delivery) <- c("Cesarean", "Vaginal")
+
+cols4methods <- c("steelblue3",
+                  "gray", "darkgoldenrod3")
+names(cols4methods) <- c("MEFISTO",
+                         "MOFA2", "CTF") 
+
+# helper function to load factors and weights of different models
+source("utils_stability.R")
+
+# out directory with trained models
+outdir <- "out/"
+
+# set output directory for  figures
+today <- Sys.Date()
+figdir <- paste0("figures_microbiome-", today, "/stability/")
+if(!dir.exists(figdir)) {
+  dir.create(figdir)
+}
+
+knitr::opts_chunk$set(dev = c("png", "pdf"), fig.path = figdir)
+```
+
+```{r}
+samples_meta <- read.csv("data/processed_data/samples_metadata.csv")
+features_meta <- read.csv("data/processed_data/features_metadata.csv")
+features_meta <- rename(features_meta, feature_id = SampleID)
+samples_meta <- rename(samples_meta, sample_id = SampleID)
+
+samples_present <- samples_meta %>%
+  mutate(sample_id = paste(child_id, month, sep = "_")) %>%
+  .$sample_id %>% unique()
+```
+
+
+# Load models
+```{r load_models, eval = !file.exists(file.path(outdir, "df_Z.csv"))}
+# MEFISTO
+MEFSITOres <- load_files(outdir = outdir,
+                         pattern = "^MEFISTO")
+MEFSITOres$method <- "MEFISTO"
+
+# MOFA
+MOFAres <- load_files(outdir = outdir,
+                      pattern = "^MOFA")
+MOFAres$method <- "MOFA2"
+
+# CTF
+CTFres <- load_files_CTF(outdir = outdir)
+CTFres$method <- "CTF"
+
+# gather results from all methods
+df_Z <- bind_rows(MOFAres, MEFSITOres, CTFres)
+
+# check
+stopifnot(!any(duplicated(df_Z)))
+
+# Add meta data
+df_Z <- left_join(df_Z, samples_meta, by = "sample_id")
+
+# Get samples which are present in the full (non-masked data)
+df_Z %<>% filter(sample_id %in% samples_present)
+df_Z %<>% mutate(Factor1 = ifelse(is.na(Factor1), 0, Factor1))
+df_Z %<>% mutate(Factor2 = ifelse(is.na(Factor2), 0, Factor2))
+
+write.csv(df_Z, file = file.path(outdir, "df_Z.csv"))
+```
+
+```{r}
+df_Z <- read.csv(file = file.path(outdir, "df_Z.csv"))
+```
+
+# Factor stability
+```{r corZ, fig.width=7, fig.height=4}
+Zmat1 <- acast(df_Z, sample_id ~ method + seed + miss_times,
+               value.var = "Factor1")
+df_corZ <- abs(cor(Zmat1)) %>%
+  melt(value.name = "correlation") %>%
+  separate(Var1,into = c("method1", "seed1", "time_miss1"), sep = "_")%>%
+  separate(Var2,into = c("method2", "seed2", "time_miss2"), sep = "_") %>% 
+  filter(method1 ==  method2, time_miss1 == 0, time_miss2 >0) %>%
+  select(method = method1, time_miss = time_miss2, seed = seed2, correlation)%>%
+  mutate(time_miss = as.numeric(time_miss), factor = "Factor 1")
+
+Zmat2 <- acast(df_Z, sample_id ~ method + seed + miss_times, value.var = "Factor2")
+df_corZ2 <- abs(cor(Zmat2)) %>% melt(value.name = "correlation") %>%
+  separate(Var1,into = c("method1", "seed1", "time_miss1"), sep = "_")%>%
+  separate(Var2,into = c("method2", "seed2", "time_miss2"), sep = "_") %>% 
+  filter(method1 ==  method2, time_miss1 == 0, time_miss2 >0) %>%
+  select(method = method1, time_miss = time_miss2, seed = seed2, correlation)%>%
+  mutate(time_miss = as.numeric(time_miss), factor = "Factor 2")
+
+df_corZ <- rbind(df_corZ, df_corZ2)
+df_corZ %>%
+ggplot(aes(x=time_miss, y = correlation, col = method)) +
+  stat_summary(fun.data = "mean_se") + theme_bw() +
+  ylab("Correlation to factor values in full model") +
+  stat_summary(geom = "line", fun.data = "mean_se") +
+  facet_wrap(~factor) + scale_color_manual(values = cols4methods) +
+  xlab(paste0("# missing samples (out of ",  length(samples_present),")"))
+```
+
+
+```{r}
+sessionInfo()
+```
+

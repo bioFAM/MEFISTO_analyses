@@ -1,0 +1,86 @@
+---
+title: "Compare interpolation results with univariate GPs"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(magrittr)
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_evodevo-", today, "/interpolation_comparison/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+```
+
+```{r}
+# define colors for Methods
+cols2methods <- c("steelblue3",
+                  "gray", "darkolivegreen")
+names(cols2methods) <- c("MEFISTO",
+                         "MOFA2", "univariate GPs") 
+```
+
+# Load results 
+```{r load}
+dfFA <- read.csv("out/interpol_results_evodevo_single_mod_FA.csv")
+dfGP <- read.csv("out/interpol_results_evodevo_single_mod_univGPs.csv")
+df <- rbind(dfFA, dfGP)
+
+df %<>% mutate(method = ifelse(method =="FA",
+                               ifelse(GP_factors, "MEFISTO", "MOFA2"),
+                               "univariate GPs"))
+df %<>% mutate(mem_usage = as.numeric(mem_usage) / 2^10 / 2^10) # set to MB
+df %<>% mutate(time = as.numeric(time) / 60) # set to min
+```
+
+# Plot interpolation accuracy in different scenarios
+```{r interpolation, fig.height=3, fig.width=10}
+lev <- paste(sort(unique(df$frac_features))*100,
+             "% missing features")
+df %<>% mutate(frac_features = factor(paste(frac_features*100,
+                                            "% missing features"),
+                                      levels = lev))
+gg_mse <- ggplot(df, aes(x=Tmissing, y = mse, col = method)) +
+  facet_wrap(~ frac_features, nrow = 1) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se") + 
+  xlab("Missing time points") + ylab("Mean squared error") +
+  theme_bw() + scale_color_manual(values = cols2methods)
+
+gg_mse
+```
+
+# Memory and time requirement
+```{r time_mem}
+# average memory and time usage
+df %>% group_by(method) %>%
+  summarise(mean(mem_usage), mean_min = mean(time),
+            mean_sed = mean(time*60))
+
+gg_time <- ggplot(df, aes(x=Tmissing, y = time, col = method)) +
+  facet_wrap(~ frac_features, nrow = 1) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se") + 
+  xlab("Missing time points") + ylab("Time [min]") + theme_bw() + scale_color_manual(values = cols2methods)
+gg_time
+
+gg_mem <- ggplot(df, aes(x=Tmissing, y = mem_usage, col = method)) +
+  facet_wrap(~ frac_features, nrow = 1) +
+  stat_summary(fun.data = "mean_se", geom = "line") +
+  stat_summary(fun.data = "mean_se") + 
+  xlab("Missing time points") + ylab("Memory [MB]") +
+  theme_bw() + scale_color_manual(values = cols2methods)
+gg_mem
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+

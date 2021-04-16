@@ -1,0 +1,101 @@
+---
+title: "Evaluate imputation comparison"
+author: "Britta Velten"
+date: "3/2/2021"
+output: BiocStyle::html_document
+---
+
+```{r}
+library(tidyverse)
+library(magrittr)
+```
+
+```{r}
+outdir <- "out"
+
+# define colors for Methods
+cols2methods <- c("steelblue3",
+                  "gray", "darkolivegreen")
+names(cols2methods) <- c("MEFISTO",
+                         "MOFA2", "univariate GPs") 
+
+# set output directory for  figures
+today <- Sys.Date()
+figdir = paste0("figures_univGP", today, "/")
+if(!dir.exists(figdir)) {
+  dir.create(figdir)
+}
+
+knitr::opts_chunk$set(dev = c("png", "pdf"), fig.path = figdir)
+```
+
+```{r}
+res_MEFISTO <- read.csv(file.path(outdir, "interpolation_results_MEFISTO.csv"))
+res_MOFA <- read.csv(file.path(outdir, "interpolation_results_MOFA2.csv"))
+res_univGPs <- read.csv(file.path(outdir, "interpolation_results_univGPs.csv"))
+res <- rbind(res_MEFISTO, res_MOFA, res_univGPs)
+res <- filter(res, !is.na(mse))
+
+# some renaming etc
+res %<>% rename(noise = noise_level)
+res %<>% mutate(time = as.numeric(time))
+res %<>% filter(n_factors_sim > 1)
+res %<>% mutate(Dm = as.numeric(Dm))
+res %<>% mutate(N = as.numeric(N))
+res %<>% mutate(missing = as.numeric(missing) * 100 +  as.numeric(missing_all) * 100) # turn to percentage
+res %<>% mutate(mem_usage = as.numeric(mem_usage) / 2^10 / 2^10) # set to MB
+res %<>% mutate(time = as.numeric(time) / 60) # set to min
+```
+
+# Time and memory
+```{r, mem_usage}
+gg_mem <- res %>% filter(note == "vary_Dm") %>%
+  mutate(method = ifelse(method == "univGPs", "univariate GPs", method)) %>%
+  ggplot(aes(y=mem_usage,x = Dm, col =method)) + stat_summary() +
+  stat_summary(geom="line", fun.data = "mean_se")+ ylab("memory [MB]")+
+  scale_color_manual(values = cols2methods) + theme_bw() + guides(col=FALSE) +
+  xlab("Number of features")
+```
+
+```{r, time}
+gg_time <- res %>% filter(note == "vary_Dm") %>%
+  mutate(method = ifelse(method == "univGPs", "univariate GPs", method)) %>%
+  ggplot(aes(y=time,x = Dm, col =method)) + stat_summary() + ylab("time [min]")+
+  stat_summary(geom="line", fun.data = "mean_se")+ scale_color_manual(values = cols2methods) + theme_bw() + guides(col=FALSE)+
+  xlab("Number of features")
+```
+
+```{r}
+gg_compl <- cowplot::plot_grid(gg_mem, gg_time, ncol =1)
+```
+
+# Imputation/Interplation MSE
+```{r}
+gg_mse <- res %>%
+  select(c("N", "missing", "n_factors_sim", "scales_0", "method", "mse", "note")) %>%
+  mutate(n_factors_sim = n_factors_sim -2) %>%
+  gather(key = "parameter", value = "value", -c("method", "mse", "note")) %>%
+  mutate(parameter = ifelse(parameter == "scales_0", "smoothness", parameter)) %>%
+  mutate(method = ifelse(method == "univGPs", "univariate GPs", method)) %>%
+  filter(paste0("vary_",parameter) == note) %>% 
+  mutate(parameter =  ifelse(parameter == "N", "Number of timepoints", parameter)) %>%
+  mutate(parameter = ifelse(parameter == "missing",
+                            "% missing", parameter)) %>%
+    mutate(parameter = ifelse(parameter == "n_factors_sim",
+                            "Extra temporal sources of variation", parameter)) %>%
+  mutate(value = as.numeric(value)) %>%
+  ggplot(aes(x=value, y=mse, col = method)) + stat_summary(fun.data = "mean_se") +
+  stat_summary(geom="line", fun.data = "mean_se") +
+  scale_color_manual(values = cols2methods) + ylab("Mean squared error") +
+  theme_bw() + facet_wrap(~parameter, scales = "free") + theme(legend.position = "top")
+```
+
+```{r, GP_comparison, height =12, width = 3.5}
+cowplot::plot_grid(gg_mse, gg_compl, labels = c("A","B"),
+                   ncol = 2, rel_widths = c(2,1), axis = "t", align = "h")
+```
+
+```{r}
+sessionInfo()
+```
+

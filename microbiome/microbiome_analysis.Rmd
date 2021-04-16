@@ -1,0 +1,485 @@
+---
+title: "Microbiome application of MEFISTO"
+author: "Britta Velten"
+date: "`r Sys.Date()`"
+output: BiocStyle::html_document
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(MOFA2)
+library(reshape2)
+library(cowplot)
+source("utils.R")
+source("utils_microbiome.R")
+library(magrittr)
+
+cols4diet <- c("#1f78b4", "#b2df8a")
+names(cols4diet) <- c("fd", "bd")
+
+cols4delivery <- c("#e6ab02", "#d95f02")
+names(cols4delivery) <- c("Cesarean", "Vaginal")
+
+# set output director for  figures
+today <- Sys.Date()
+figdir = paste0("figures_microbiome-", today, "/")
+if(!dir.exists(figdir)) dir.create(figdir)
+knitr::opts_chunk$set(dev = c("png", "pdf"),
+                      fig.path = figdir)
+```
+
+```{r}
+datadir <- "data/processed_data/"
+```
+
+
+# Load data
+```{r}
+samples_meta <- read.csv(file.path(datadir, "samples_metadata.csv"))
+features_meta <- read.csv(file.path(datadir, "features_metadata.csv"))
+data <- read.csv(file.path(datadir, "rclr_mat_filtered.csv"),row.names = 1)
+
+colnames(data) <- gsub("X10249", "10249", colnames(data))
+data <- as.matrix(data)
+df_data <- melt(data, varnames = c("feature_id", "sample_id")) %>%
+  left_join(select(samples_meta, sample_id = SampleID, child_id, month),
+            by = "sample_id")
+
+# average per month (done internally in CTF)
+df_data <- df_data %>%
+  group_by(month, child_id, feature_id) %>%
+  summarise(value = mean(value)) %>% ungroup()
+
+# make child-level df on meta data
+meta_child <- select(samples_meta, child_id, delivery, diet, sex)
+meta_child <- meta_child[!duplicated(meta_child),]
+
+# expand
+df_data <- complete(df_data,expand(df_data, child_id, month, feature_id))
+
+# fill in child-level information
+df_data$view <- "microbiome"
+df_data <- mutate(df_data, sample_id = paste(child_id, month, sep ="_"))
+df_data <- df_data %>% left_join(meta_child, by = "child_id")
+
+# turn zeros to NAs (no longer meaningful, following Martino et al, Nat Biotech 2021)
+df_data <- mutate(df_data, value = ifelse(value == 0, NA, value))
+
+# center features
+df_data <- df_data %>% group_by(feature_id) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE)) %>% ungroup() %>%
+  left_join(df_data, ., by = "feature_id") %>%
+  mutate(value = value - mean_value) %>% 
+  select(-mean_value)
+
+# rename as required by MOFA/MEFISTO
+df_data <- rename(df_data, feature = feature_id,
+                  sample = sample_id, group = child_id)
+head(df_data)
+```
+
+
+# Create and train MOFA object
+```{r}
+# create the MOFA object and add times as covariate
+MOFAobject_untrained <- create_mofa(data = df_data)
+MOFAobject_untrained <- set_covariates(MOFAobject_untrained, covariates = "month")
+MOFAobject_untrained
+```
+
+```{r}
+traindata_dir <- "data/input_data_rclr/"
+```
+
+```{r, eval = !dir.exists(traindata_dir)}
+# optional: export data for training from python
+dir.create(traindata_dir)
+write.csv(df_data, file = file.path(traindata_dir, "microbiome_data.csv"))
+export_data(model = MOFAobject_untrained, dir = traindata_dir)
+write.csv(groups_names(MOFAobject_untrained),
+          file = file.path(traindata_dir, "groups.csv"))
+write.csv(views_names(MOFAobject_untrained),
+          file = file.path(traindata_dir, "views.csv"))
+```
+
+**Prepare the MOFA object**
+```{r MOFA_options}
+data_opts <- get_default_data_options(MOFAobject_untrained)
+data_opts$center_groups <- FALSE
+
+model_opts <- get_default_model_options(MOFAobject_untrained)
+model_opts$num_factors <- 2
+
+mefisto_opts <- get_default_mefisto_options(MOFAobject_untrained)
+mefisto_opts$n_grid <- 10
+mefisto_opts$start_opt <- 50
+mefisto_opts$opt_freq <- 50
+
+train_opts <- get_default_training_options(MOFAobject_untrained)
+train_opts$seed <- 2020
+```
+
+```{r prepare_MOFA, message = FALSE}
+MOFAobject_untrained <- prepare_mofa(
+  object = MOFAobject_untrained,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts,
+  mefisto_options = mefisto_opts
+) 
+```
+
+**Train the MOFA model**
+```{r}
+outdir <- "out/"
+filename <- "MEFISTO_0_0.hdf5"
+outfile <- file.path(outdir, filename)
+```
+
+```{r train_MOFA, eval = FALSE}
+# MOFAobject <- run_mofa(MOFAobject_untrained, outfile = outfile)
+```
+
+For all further analysis we will use a pre-trained model. If this is not yet available, we can run `run_ECAM.py` (or `submit_training.sh`) to train the model from python on the data exported above from the untrained MOFA object. Once the trained models are obtained, we can continue with the downstream analysis below.
+```{r}
+knitr::opts_chunk$set(eval = file.exists(outfile), echo = file.exists(outfile))
+```
+
+# Load trained model
+```{r load_model, warning = FALSE}
+MOFAobject <- load_model(outfile, load_interpol_Z = TRUE)
+MOFAobject
+
+# add columns with nice name to metadata 
+df <- samples_metadata(MOFAobject)
+samples_metadata(MOFAobject) <- left_join(df, samples_metadata(MOFAobject_untrained),
+                                          by = c("sample", "group","month"))
+```
+
+# Downstream analyses
+
+## Variance explained by factor
+Let's have a look how much variance the two factors explain jointly in the data.
+```{r}
+summary(Reduce(c,calculate_variance_explained(MOFAobject)$r2_total))
+```
+
+
+## Interpolation
+Using the learnt Gaussian Processes, we can extrapolate or interpolate the factors to missing time intervals.
+```{r, fig.width=12, fig.height=12}
+plot_interpolation_vs_covariate(MOFAobject, only_mean = F) + facet_wrap(~group)
+plot_interpolation_vs_covariate(MOFAobject, only_mean = F, factor = 2) + facet_wrap(~group)
+```
+
+## Factors versus month of life
+Here, we plot the inferred factors versus month of life coloured by diet and delivery mode of the children.
+```{r, warning=F, message=F}
+df <- plot_factors_vs_cov(MOFAobject, color_by = "delivery", return_data = TRUE)
+gg_delivery <- ggplot(df, aes(x=value.covariate, y = value.factor, color = color_by)) +
+  geom_point(size=0.3, alpha =0.3) + facet_wrap(~factor) +
+  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  scale_color_manual(values = cols4delivery) +
+  xlab("month of life") + guides(col = FALSE) +
+  theme_bw() + ylab("Factor value")
+gg_delivery
+
+df <- plot_factors_vs_cov(MOFAobject, color_by = "diet", return_data = TRUE)
+gg_diet <- ggplot(df, aes(x=value.covariate, y = value.factor, color = color_by)) +
+  geom_point(size=0.3, alpha =0.3) + facet_wrap(~factor) +
+  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  scale_color_manual(values = cols4diet) +
+  xlab("month of life") + guides(col = FALSE) +
+  theme_bw() + ylab("Factor value")
+gg_diet
+```
+
+Combine the two plots.
+```{r}
+gg_fac <- cowplot::plot_grid(gg_delivery, gg_diet,
+                             ncol = 1, axis = "lr", align = "vh", labels = LETTERS[1:2])
+```
+
+## Scatterplot
+We can also look at the factor values on the sample level.
+Here each dot correspond to one time-point-baby combination.
+```{r scatter, fig.width=9, fig.height=3.5}
+gg_scatter <- plot_grid(
+plot_factors(MOFAobject, color_by = "delivery") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = cols4delivery),
+plot_factors(MOFAobject, color_by = "diet") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = cols4diet),
+plot_factors(MOFAobject, color_by = "month") +
+  theme(legend.position = "top"),
+nrow = 1, align = "h", axis = "tb")
+
+gg_scatter
+```
+
+## Weights
+Next we have a look at the microbial species associated with the two factors.
+For this we have a look at the weights of each factor.
+
+First we load the meta information on the features.
+```{r}
+taxonomy <- read.csv("data/processed_data/features_metadata.csv" )
+features_metadata(MOFAobject) <- features_metadata(MOFAobject) %>%
+  left_join(taxonomy, by = c("feature" = "SampleID")) %>%
+  separate(col = Taxon, sep = ";",into = c("kingdom", "phylum", "class",
+                                           "order", "family", "genus", "species"),
+                                  remove = FALSE)
+
+# make feature names based on taxonomy
+MOFAobject_fcodes <- MOFAobject # keep old  in alternative object for later analyses
+features_names(MOFAobject) <- list(microbiome = features_metadata(MOFAobject)$Taxon)
+```
+
+### Factor 1
+Let's first have a look at the top positive and top negative species on factor 1.
+```{r}
+# top negative ones (more dominant in vaginal)
+get_weights(MOFAobject, factors = 1, as.data.frame = TRUE) %>%
+  arrange(value) %>% head(20) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+           remove = FALSE) %>% select(class, order, family, genus, species, value) 
+
+# top positive ones  (more dominant in C-section)
+get_weights(MOFAobject, factors = 1, as.data.frame = TRUE) %>%
+  arrange(-value) %>% head(20) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+           remove = FALSE) %>% select(class, order, family, genus, species) 
+```
+
+We now summarise this on the genus level.
+```{r w1}
+df_weights1 <- get_weights(MOFAobject, as.data.frame = T, factors = 1) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"),
+           remove = FALSE)
+
+gg_w1 <- make_genera_plot(df_weights1, factor_name = "Factor1")
+```
+
+### Factor 2
+Let's do the same for factor 2.
+```{r}
+get_weights(MOFAobject, as.data.frame = T, factors = 2) %>%
+  arrange(-abs(value)) %>% select(value, feature) %>% head(10)
+```
+
+```{r w2}
+df_weights2 <- get_weights(MOFAobject, as.data.frame = T, factors = 2) %>%
+  separate(col = feature, sep = ";",
+           into = c("kingdom", "phylum", "class", "order",
+                    "family", "genus", "species"),
+           remove = FALSE)
+
+gg_w2 <- make_genera_plot(df_weights2, factor_name = "Factor2", type = "diet")
+```
+
+## Clustering of babies per factor
+Next we can look into the clustering of babies on each factor.
+```{r}
+# get metadata of babies for annotation of groups in heatmap
+df_anno <- samples_metadata(MOFAobject) %>% as.tibble() %>% 
+  group_by(group) %>%
+  summarise(diet = unique(diet),
+            sex = unique(sex),
+            delivery = unique(delivery)) %>%
+  select(group, delivery, diet, sex) %>%
+  ungroup() %>%
+  column_to_rownames("group")
+
+# set colors
+anno_col <- list(diet = cols4diet,
+                 delivery = cols4delivery,
+                 sex = c(Female = "pink", Male = "lightblue"))
+
+wd <- 3.5
+gg1 <- plot_group_kernel(MOFAobject, factors = 1, show_rownames = FALSE, show_colnames = FALSE,
+                  annotation_row = df_anno,
+                  annotation_names_row = FALSE,
+                  annotation_legend= FALSE, annotation_colors=anno_col,
+                  treeheight_row =5, treeheight_col =5,
+                  main = "", legend = FALSE, fontsize =9,
+                  cellheight = wd, cellwidth = wd)
+gg2 <- plot_group_kernel(MOFAobject, factors = 2, show_rownames = FALSE, show_colnames = FALSE,
+                  annotation_row = df_anno,
+                  annotation_names_row = FALSE,
+                  annotation_legend= TRUE, annotation_colors=anno_col,
+                  treeheight_row =5, treeheight_col =5,
+                  main = "", legend = FALSE, fontsize =9,
+                  cellheight = wd, cellwidth = wd)
+
+# combine plots
+gghm <- cowplot::plot_grid(gg1, gg2, nrow = 1,
+                          scale = 0.9, rel_widths = c(0.75, 1))
+```
+
+
+# Main figure
+For completeness, we here assemble the whole figure on this application.
+```{r Figure3, fig.height=7, fig.width=14}
+cowplot::plot_grid(cowplot::plot_grid(gg_fac, gg_scatter,
+                                      labels = c("", "C"),
+                                      rel_widths = c(1,1.5),
+                                      align = "h", axis = "tb"),
+                   cowplot::plot_grid(gghm, gg_w1, gg_w2,
+                                      rel_widths = c(2,1.2,1.2), nrow = 1,
+                                      labels = c("D", "E"), scale = 0.99), 
+                   ncol =1, labels = c("", "C", "D"), align = "v",
+                   axis = "lr", rel_heights = c(1.1,1))
+```
+
+
+# Comparsion to CTF
+
+## Factor 1
+### CTF factor
+```{r}
+CTF_file <- "CTF_0_0_CTF_straj.csv"
+factors_CTF <- read.csv(file.path(outdir,CTF_file))
+factors_CTF<- factors_CTF %>% mutate(sample = paste(subject_id, month, sep= "_")) %>%
+  select(sample, Factor1 = PC1, Factor2= PC2) %>%
+  left_join(samples_metadata(MOFAobject), by = "sample")
+
+gg_CTF_Z1 <- ggplot(factors_CTF, aes(x=month, y = Factor1, col = delivery)) +
+  geom_point(alpha =0.2, size =0.5) + stat_summary(geom = "line") +
+  scale_color_manual(values = cols4delivery) + theme_bw() +
+  ggtitle("CTF component 1")
+```
+
+### CTF weights
+```{r}
+# get weights inferred by CTF
+CTF_file <- "CTF_0_0_CTF_subj_ord_features.csv"
+weights_CTF <- read.csv(file.path(outdir,CTF_file))
+weights_CTF %<>% select(feature = X, Factor1 = PC2, Factor2 = PC2)
+
+#scale to -1 to 1
+weights_CTF$Factor1 <- weights_CTF$Factor1/ max(abs(weights_CTF$Factor1))
+weights_CTF$Factor2 <- weights_CTF$Factor2/ max(abs(weights_CTF$Factor2))
+weights_CTF %<>% gather(key = "factor", value = "value", -feature) 
+weights_CTF %<>% left_join(taxonomy, by = c("feature" = "SampleID"))
+weights_CTF %<>% separate(col = Taxon, sep = ";",
+                           into = c("kingdom", "phylum", "class",
+                                    "order", "family", "genus", "species"))
+```
+
+Make genera based plot for CTF
+```{r}
+df_CTF <- weights_CTF %>% filter(factor == "Factor1")
+
+gg_w1_CTF <- make_genera_plot(df_CTF, factor_name = "Factor1", ngenera = 5) +
+  ggtitle("Weights for CTF component 1")
+gg_w1_CTF
+```
+
+### MEFISTO correspondences
+```{r}
+# factor
+df <- plot_factors_vs_cov(MOFAobject, color_by = "delivery", return_data = TRUE)
+gg_Z1 <- df %>% filter(factor == "Factor1") %>%
+  ggplot(aes(x=value.covariate, y = value.factor, color = color_by)) +
+  geom_point(size=0.3, alpha =0.3) + 
+  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  scale_color_manual(values = cols4delivery) +
+  xlab("month of life") + guides(col = FALSE) +
+  theme_bw() + ylab("Factor value") + ggtitle("MEFISTO - Factor 1")
+
+# weights
+gg_w1 <- gg_w1 + ggtitle("Weights for MEFISTO Factor 1")
+```
+
+### Figure
+```{r}
+cowplot::plot_grid(gg_CTF_Z1 + guides(col=F) + xlab("month of life"),
+  gg_w1_CTF + theme(legend.position = "right"),
+  gg_Z1,
+  gg_w1+ theme(legend.position = "right"),
+  labels = LETTERS[1:4], rel_widths = c(1,1.5))
+```
+
+## Factor 2
+### CTF factor
+```{r}
+CTF_file <- "CTF_0_0_CTF_straj.csv"
+factors_CTF <- read.csv(file.path(outdir,CTF_file))
+factors_CTF<- factors_CTF %>% mutate(sample = paste(subject_id, month, sep= "_")) %>%
+  select(sample, Factor1 = PC1, Factor2= PC2) %>%
+  left_join(samples_metadata(MOFAobject), by = "sample")
+
+gg_CTF_Z2 <- ggplot(factors_CTF, aes(x=month, y = Factor2, col = delivery)) +
+  geom_point(alpha =0.2, size =0.5) + stat_summary(geom = "line") +
+  scale_color_manual(values = cols4delivery) + theme_bw() +
+  ggtitle("CTF component 2")
+```
+
+### CTF weights
+```{r}
+# get weights inferred by CTF
+CTF_file <- "CTF_0_0_CTF_subj_ord_features.csv"
+weights_CTF <- read.csv(file.path(outdir,CTF_file))
+weights_CTF %<>% select(feature = X, Factor1 = PC2, Factor2 = PC2)
+
+#scale to -1 to 1
+weights_CTF$Factor1 <- weights_CTF$Factor1/ max(abs(weights_CTF$Factor1))
+weights_CTF$Factor2 <- weights_CTF$Factor2/ max(abs(weights_CTF$Factor2))
+weights_CTF %<>% gather(key = "factor", value = "value", -feature) 
+weights_CTF %<>% left_join(taxonomy, by = c("feature" = "SampleID"))
+weights_CTF %<>% separate(col = Taxon, sep = ";",
+                           into = c("kingdom", "phylum", "class",
+                                    "order", "family", "genus", "species"))
+```
+
+Make genera based plot for CTF
+```{r}
+df_CTF <- weights_CTF %>% filter(factor == "Factor2")
+
+gg_w2_CTF <- make_genera_plot(df_CTF, factor_name = "Factor2", ngenera = 5) +
+  ggtitle("Weights for CTF component 2")
+```
+
+### MEFISTO correspondences
+```{r}
+# factor
+df <- plot_factors_vs_cov(MOFAobject, color_by = "diet", return_data = TRUE)
+gg_Z2 <- df %>% filter(factor == "Factor2") %>%
+  ggplot(aes(x=value.covariate, y = value.factor, color = color_by)) +
+  geom_point(size=0.3, alpha =0.3) + 
+  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  scale_color_manual(values = cols4diet) +
+  xlab("month of life") + guides(col = FALSE) +
+  theme_bw() + ylab("Factor value") + ggtitle("MEFISTO - Factor 2")
+
+# weights
+gg_w2 <- gg_w2 + ggtitle("Weights for MEFISTO Factor 2")
+```
+
+
+### Figure
+```{r}
+cowplot::plot_grid(gg_CTF_Z2 + guides(col=F) + xlab("month of life"),
+  gg_w2_CTF + theme(legend.position = "right"),
+  gg_Z2,
+  gg_w2+ theme(legend.position = "right"),
+  labels = LETTERS[1:4], rel_widths = c(1,1.5))
+```
+
+## Correlation
+```{r}
+factors_CTF %>% select(Factor1, Factor2) %>%
+  cor() %>% corrplot::corrplot()
+get_factors(MOFAobject) %>% Reduce(rbind, .) %>%
+  cor()%>% corrplot::corrplot()
+```
+
+# SessionInfo
+```{r}
+sessionInfo()
+```
+

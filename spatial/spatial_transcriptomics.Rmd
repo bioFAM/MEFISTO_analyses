@@ -77,16 +77,16 @@ Here, we in particular, specify that we want to use spare Gaussian process with 
 model_opts <- get_default_model_options(sm)
 model_opts$num_factors <- 4
 
-smooth_opts <- get_default_smooth_options(sm)
-smooth_opts$sparseGP <- TRUE
-smooth_opts$frac_inducing <- n_inducing / get_dimensions(sm)$N
+mefisto_opts <- get_default_mefisto_options(sm)
+mefisto_opts$sparseGP <- TRUE
+mefisto_opts$frac_inducing <- n_inducing / get_dimensions(sm)$N
 
 train_opts <- get_default_training_options(sm)
 train_opts$seed <- 2021
 
 sm <- prepare_mofa(sm, training_options = train_opts,
                    model_options = model_opts,
-                   smooth_options = smooth_opts)
+                   mefisto_options = mefisto_opts)
 ```
 
 
@@ -107,8 +107,9 @@ knitr::opts_chunk$set(eval = file.exists(outfile), echo = file.exists(outfile))
 ```{r}
 sm <- load_model(outfile)
 
-# add feature names back on trained model
-features_names(sm) <- list(rownames(expression_data))
+# add feature names back on trained model and update to new model
+views_names(sm) <- "RNA"
+features_names(sm) <- list(RNA = rownames(expression_data))
 ```
 
 
@@ -166,7 +167,8 @@ To explore the expression patterns of these genes that are highlighted on the we
 ```{r}
 W <- get_weights(sm)[[1]]
 top_weights <- rownames(W)[apply(abs(W), 2, which.max )]
-list_seurat <- SpatialFeaturePlot(brain, features = top_weights,
+top_pos_weights <- rownames(W)[apply(W, 2, which.max )]
+list_seurat <- SpatialFeaturePlot(brain, features = top_pos_weights,
                                 combine = F)
 gg_seurat <- plot_grid(plotlist = list_seurat, nrow = 1)
 gg_seurat
@@ -182,6 +184,36 @@ cowplot::plot_grid(gg_factor,
                    labels = LETTERS[1:3], ncol = 1, axis = "hv", scale = 0.95,
                    align = "lr", rel_heights = c(1.15, 0.9, 0.85))
 ```
+
+
+# Gene set enrichment analysis
+Cell type markers were downloaded from `https://panglaodb.se/markers.html?cell_type=%27choose%27` and used for an enrichment analysis.
+```{r}
+markers <- read.table("data/PanglaoDB_markers_27_Mar_2020.tsv",
+                      sep = "\t", header = 1)
+marker <- filter(markers, organ == "Brain", grepl("Mm", species))
+markers_mat <- reshape2::acast(markers, cell.type ~ official.gene.symbol,
+                               value.var = "organ",
+                               fun.aggregate = length)
+
+features_names(sm) <- list(RNA = toupper(features_names(sm)[[1]]))
+colnames(markers_mat) <- toupper(colnames(markers_mat))
+
+res_enrich_pos <- MOFA2::run_enrichment(sm, view = "RNA",
+                                        feature.sets = markers_mat,
+                                        sign = "positive")
+```
+
+```{r enrich_pos, fig.height=12, fig.width=8}
+plist <- lapply(seq_len(sm@dimensions$K), function(k){
+  cowplot::plot_grid(plot_enrichment(res_enrich_pos, k, alpha = 0.01),
+                      plot_enrichment_detailed(res_enrich_pos, k, alpha = 0.01),
+                     rel_widths = c(0.5,0.7))
+})
+
+cowplot::plot_grid(plotlist = plist, ncol =1, labels = LETTERS[1:4])
+```
+
 
 # Analysis on the number of inducing points
 Above, we have used a subset of 1,000 points as inducing points for MEFISTO. Here, we compare the results to models that use all spots or less spots to model the spatial covariance patterns.
@@ -238,6 +270,42 @@ cowplot::plot_grid(gg_comp$gtable, gg_t,
 ```
 
 We can see that 4 factors are stably recovered with different number of inducing points, the memory and time is greatly reduced by the usage of inducing points.
+
+## Comparison of interpolation accuracy
+```{r final_supp_figure}
+cols2methods <- c(RColorBrewer::brewer.pal(3, "Blues"), "gray")
+names(cols2methods) <- c("MEFISTO-500",
+                         "MEFISTO-1000",
+                         "MEFISTO-all",
+                         "MOFA2")
+
+# load results
+df <- read.csv("out/interpol_results_spatial.csv")
+
+# nicer names
+df %<>% mutate(method = ifelse(GP_factors, "MEFISTO", "MOFA2"))
+df <- mutate(df, n_inducing = ifelse(n_inducing == 5000, "all", n_inducing))
+df %<>% filter(method != "MOFA2" | n_inducing == "all") # remove duplicates
+df %<>% mutate(method = ifelse(method == "MOFA2", "MOFA2", paste(method, n_inducing, sep="-")))
+df$method <- factor(df$method, levels = c("MEFISTO-500", "MEFISTO-1000", "MEFISTO-all", "MOFA2"))
+
+gg_interpol <- ggplot(df, aes(x=method, y = mse, fill = method)) +
+  geom_violin() + 
+  xlab("Method") +
+  ylab("Mean squared error") + theme_bw() +
+  scale_fill_manual(values = cols2methods) +
+  geom_boxplot(width = 0.2) +
+  geom_point() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+cowplot::plot_grid(plot_grid(gg_comp$gtable, gg_t, gg_mem, labels = c("A", "B", "C"), rel_widths = c(1.5,1,1), nrow = 1),
+                   plot_grid(gg_elb, gg_interpol +
+                               theme(axis.text.x = element_blank(), legend.text = element_text(size = 8)) +
+                               guides(fill = guide_legend(title = "")),
+                             labels = c("D", "E"),
+                             rel_widths = c(1.5,2)),
+                   scale = 0.9, ncol = 1)
+```
 
 # SessionInfo
 ```{r}

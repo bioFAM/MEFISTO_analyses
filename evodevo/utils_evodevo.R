@@ -275,6 +275,34 @@ plot_gsea_across_organs <- function(object, df, fac,
 }
 
 
+plot_gsea_heatmap <- function(factor = "Factor1", exclude_views = NA, npathways = 10, stats = max) {
+  #subset log p values from gsea to one factor and spread views
+  logp_f <- subset(logp, select = c("pathway", factor, "view")) %>% 
+    filter(!view %in% exclude_views) %>%
+    spread(key = view, value = factor)
+  
+  #calculate stats (maximum, mean or median of -log p) over the views to select top pathways 
+  logp_f %<>% mutate(statistic = apply(logp_f[, 2:ncol(logp_f)], 1, stats, na.rm = TRUE))
+  logp_f <-logp_f[order(logp_f$statistic, decreasing = TRUE), ] %>% 
+    filter(statistic > 1.3) #filter with FDR higher 5%
+  
+  #plot npathways with highest max, mean or median log p value
+  if (npathways == "all"){
+    npathways = nrow(logp_f)
+  }
+  
+  selected_pathways <- logp_f[1:npathways, ]
+  rownames(selected_pathways) <- selected_pathways[ , 1]
+  
+  color <- c("#FFFFFF", brewer.pal(9, "YlOrRd"))
+  breaks <- c(0, seq(1.3, max(selected_pathways[ , 2:(ncol(selected_pathways)-1)]), length.out = 10))
+  plot <- pheatmap(selected_pathways[ , 2:(ncol(selected_pathways)-1)], 
+                   color = color, breaks = breaks, silent = TRUE,
+                   cluster_rows = FALSE, cluster_cols = FALSE, fontsize = 17)
+  return(plot$gtable)
+}
+
+
 make_fig_weight_factor <- function(object, views, fac){
   top_list <- lapply(views, function(m){
     top2_brain <- plot_top_weights(object,
@@ -288,7 +316,7 @@ make_fig_weight_factor <- function(object, views, fac){
   top <- cowplot::plot_grid(plotlist = top_list, nrow =1)
   
   temp_list <- lapply(views, function(m){
-    temp <- plot_data_vs_cov(MOFAobject_symbol,
+    temp <- plot_data_vs_cov(object,
                              factor = fac, features = 3, 
                              view = m, dot_size = 1, color_by = "species") +
       stat_summary(geom = "line", aes(col = color_by), fun = "mean") + 
@@ -310,7 +338,7 @@ make_fig_weight_factor <- function(object, views, fac){
     }
     temp
   })
- 
+  
   if(length(views) == 1){
     cowplot::plot_grid(top,
                        temp_list[[1]] ,
