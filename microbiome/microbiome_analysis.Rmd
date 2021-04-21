@@ -175,21 +175,33 @@ plot_interpolation_vs_covariate(MOFAobject, only_mean = F, factor = 2) + facet_w
 ## Factors versus month of life
 Here, we plot the inferred factors versus month of life coloured by diet and delivery mode of the children.
 ```{r, warning=F, message=F}
+median_IQR <- function(x) {
+  data.frame(y = median(x), # Median
+             ymin = quantile(x)[2], # 1st quartile
+             ymax = quantile(x)[4])  # 3rd quartile
+}
+
 df <- plot_factors_vs_cov(MOFAobject, color_by = "delivery", return_data = TRUE)
 gg_delivery <- ggplot(df, aes(x=value.covariate, y = value.factor, color = color_by)) +
   geom_point(size=0.3, alpha =0.3) + facet_wrap(~factor) +
-  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  stat_summary(aes(group = color_by, col = color_by), geom = "line", fun.y = "median")+
+  stat_summary(aes(group = color_by, fill = color_by),
+               fun.data = "median_IQR", geom = "ribbon", alpha = 0.2, colour = NA) +
   scale_color_manual(values = cols4delivery) +
-  xlab("month of life") + guides(col = FALSE) +
+  scale_fill_manual(values = cols4delivery) +
+  xlab("month of life") + guides(fill =FALSE, col = guide_legend(title = "delivery")) +
   theme_bw() + ylab("Factor value")
 gg_delivery
 
 df <- plot_factors_vs_cov(MOFAobject, color_by = "diet", return_data = TRUE)
 gg_diet <- ggplot(df, aes(x=value.covariate, y = value.factor, color = color_by)) +
   geom_point(size=0.3, alpha =0.3) + facet_wrap(~factor) +
-  stat_summary(aes(group = color_by, col = color_by), geom = "line")+
+  stat_summary(aes(group = color_by, col = color_by), geom = "line", fun.y = "median", se = TRUE)+
+  stat_summary(aes(group = color_by, fill = color_by),
+               fun.data = "median_IQR", geom = "ribbon", alpha = 0.2, colour = NA) +
   scale_color_manual(values = cols4diet) +
-  xlab("month of life") + guides(col = FALSE) +
+  scale_fill_manual(values = cols4diet) +
+  xlab("month of life") + guides(fill =FALSE, col = guide_legend(title = "diet")) +
   theme_bw() + ylab("Factor value")
 gg_diet
 ```
@@ -205,15 +217,18 @@ We can also look at the factor values on the sample level.
 Here each dot correspond to one time-point-baby combination.
 ```{r scatter, fig.width=9, fig.height=3.5}
 gg_scatter <- plot_grid(
-plot_factors(MOFAobject, color_by = "delivery") +
+ggExtra::ggMarginal(plot_factors(MOFAobject, color_by = "delivery") +
   theme(legend.position = "top") +
   scale_fill_manual(values = cols4delivery),
-plot_factors(MOFAobject, color_by = "diet") +
+  type = "boxplot", groupColour = TRUE, fill = cols4delivery, size = 10),
+ggExtra::ggMarginal(plot_factors(MOFAobject, color_by = "diet") +
   theme(legend.position = "top") +
   scale_fill_manual(values = cols4diet),
+  type = "boxplot", groupColour = TRUE, fill = cols4diet, size = 10),
 plot_factors(MOFAobject, color_by = "month") +
   theme(legend.position = "top"),
-nrow = 1, align = "h", axis = "tb")
+nrow = 1, axis = "tb")
+
 
 gg_scatter
 ```
@@ -482,4 +497,3 @@ get_factors(MOFAobject) %>% Reduce(rbind, .) %>%
 ```{r}
 sessionInfo()
 ```
-
