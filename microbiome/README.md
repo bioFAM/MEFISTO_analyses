@@ -9,6 +9,7 @@ In particular,
 * `run_ECAM.py` is the main script to prepare and train MEFISTO or alternative methods on the data and is called in `submit_training.sh`.
 * `microbiome_analysis.Rmd` performs the downstream analysis of the trained model.
 * `eval_stability.Rmd` evaluates the factor stability of MEFISTO to masking of some time points in comparison to other methods
+* `LME_and_tree_enrichments.R` contains code for the LME and the enrichment analysis on the taxonomic tree
 * `utils.R` and `utils_stability.R` contain some helper function
 
 
